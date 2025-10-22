@@ -16,6 +16,7 @@ import aiohttp
 import joblib
 from dotenv import load_dotenv
 from fastapi import FastAPI, Response, HTTPException
+from fastapi.responses import JSONResponse
 import uvicorn
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
@@ -84,7 +85,6 @@ class BotConfig:
     min_samples_for_retrain: int = int(os.getenv("MIN_SAMPLES_FOR_RETRAIN", 500))
     onchain_api_url: Optional[str] = os.getenv("ONCHAIN_API_URL")
     simulate_execution: bool = os.getenv("SIMULATE_EXECUTION", "true").lower() in ("1", "true", "yes")
-
 # -----------------------------
 # Database (signals + training dataset + perf)
 # -----------------------------
@@ -434,15 +434,28 @@ class SignalGenerator:
             return pd.DataFrame()
 
     async def fetch_orderbook_features(self, symbol: str) -> dict:
+        # Returns order book imbalance, bid/ask depth, spread percentage
         return {'spread_pct': 0.0, 'ob_imbalance': 0.0, 'bid_depth': 0.0, 'ask_depth': 0.0}
 
     async def fetch_funding_and_oi(self, symbol: str) -> tuple[float, float]:
-        return 0.0, 0.0
+        """Fetch real funding rate and open interest using CCXT"""
+        try:
+            info = await self.exchange.futures_get_funding_rate({'symbol': symbol.replace('/', '')})
+            funding_rate = float(info[0]['fundingRate']) if info else 0.0
+        except Exception:
+            funding_rate = 0.0
+        try:
+            ticker = await self.exchange.fetch_ticker(symbol)
+            open_interest = float(ticker.get('openInterest', 0.0))
+        except Exception:
+            open_interest = 0.0
+        return funding_rate, open_interest
 
     async def fetch_onchain_flow(self, symbol: str) -> float:
+        # Placeholder if using onchain metrics
         return 0.0
 
-    def simulate_execution_price(self, entry: float, ob_feats: dict, signal_type: str) -> float:
+def simulate_execution_price(self, entry: float, ob_feats: dict, signal_type: str) -> float:
         slippage = entry * self.cfg.expected_slippage_pct
         return entry + slippage if signal_type == "BUY" else entry - slippage
 
@@ -450,13 +463,13 @@ class SignalGenerator:
         async with self.gen_semaphore:
             lock = self.store.get_symbol_lock(symbol)
             async with lock:
-                # Update existing signals
+                # Update open signals with latest price
                 df_latest = await self.fetch_candles(symbol, self.cfg.timeframe)
                 if not df_latest.empty:
                     last_price = df_latest['close'].iloc[-1]
                     await self.store.update_signal_status(symbol, last_price)
 
-                # Block new signal if open exists
+                # Skip if open signal exists
                 if await self.store.has_open_signal(symbol):
                     logger.debug("Open signal exists for %s. Skipping.", symbol)
                     return
@@ -464,18 +477,12 @@ class SignalGenerator:
                 # Fetch higher TF for confirmation
                 df_1h = await self.fetch_candles(symbol, self.cfg.higher_timeframe)
                 df_4h = await self.fetch_candles(symbol, self.cfg.htf_4h)
-                if df_1h.empty:
-                    logger.debug("1H candles missing for %s. Skipping confirmation.", symbol)
-                if df_4h.empty:
-                    logger.debug("4H candles missing for %s. Skipping confirmation.", symbol)
 
-                # Add indicators
                 df = add_indicators(df_latest, self.cfg.indicators, df_1h)
                 if df.empty:
                     return
                 last = df.iloc[-1]
 
-                # Confirm with higher TF trends
                 confirm_1h = df_1h['close'].iloc[-1] > df_1h['open'].iloc[-1] if not df_1h.empty else True
                 confirm_4h = df_4h['close'].iloc[-1] > df_4h['open'].iloc[-1] if not df_4h.empty else True
 
@@ -487,7 +494,7 @@ class SignalGenerator:
                 if not signal_type:
                     return
 
-                # Features for ML
+                # Fetch additional features
                 ob_feats = await self.fetch_orderbook_features(symbol)
                 funding, oi = await self.fetch_funding_and_oi(symbol)
                 onchain = await self.fetch_onchain_flow(symbol)
@@ -510,12 +517,11 @@ class SignalGenerator:
                 if confidence < self.cfg.confidence_threshold:
                     return
 
-                # Entry, SL, TP
                 entry = float(last['close'])
                 atr = float(last['atr'] or 0)
                 if atr <= 0:
-                    logger.debug("ATR <= 0 for %s. Skipping signal.", symbol)
                     return
+
                 entry_exec = self.simulate_execution_price(entry, ob_feats, signal_type) \
                     if self.cfg.simulate_execution else entry
                 if signal_type == "BUY":
@@ -527,7 +533,6 @@ class SignalGenerator:
 
                 rr = abs((tp - entry_exec) / abs(entry_exec - sl)) if entry_exec != sl else 0
 
-                # Insert signal
                 sig = {
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "symbol": symbol,
@@ -545,7 +550,7 @@ class SignalGenerator:
                 await self.store.insert_signal(sig)
                 logger.info("Generated signal %s %s conf=%.2f%% rr=%.2f", symbol, signal_type, confidence, rr)
 
-                # Telegram
+                # Send to Telegram
                 if self.cfg.telegram_bot_token and self.cfg.telegram_chat_id:
                     msg = f"""*📊 New Signal from SignalBotAI*
 *Pair:* `{escape_telegram_markdown(sig['symbol'])}`
@@ -558,7 +563,7 @@ class SignalGenerator:
                     await send_telegram_message(self.cfg.telegram_bot_token, self.cfg.telegram_chat_id, msg)
 
 # -----------------------------
-# FastAPI App & Startup
+# FastAPI App & Heartbeat
 app = FastAPI()
 cfg = BotConfig()
 store = SignalStore(cfg.sqlite_db)
@@ -603,16 +608,13 @@ async def trigger_symbol(symbol: str):
     except Exception:
         logger.exception("Manual trigger failed for %s", symbol)
         raise HTTPException(status_code=500, detail="Trigger failed")
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
 
-app = FastAPI()
-
-# Heartbeat endpoint for GET and HEAD
+# Heartbeat endpoint (GET + HEAD)
 @app.get("/heartbeat")
 @app.head("/heartbeat")
 async def heartbeat():
     return JSONResponse(content={"status": "ok", "message": "SignalBotAI is alive"})
+
 # -----------------------------
 # Background signal monitor
 async def monitor_signals():
