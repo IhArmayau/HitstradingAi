@@ -603,7 +603,16 @@ async def trigger_symbol(symbol: str):
     except Exception:
         logger.exception("Manual trigger failed for %s", symbol)
         raise HTTPException(status_code=500, detail="Trigger failed")
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
+app = FastAPI()
+
+# Heartbeat endpoint for GET and HEAD
+@app.get("/heartbeat")
+@app.head("/heartbeat")
+async def heartbeat():
+    return JSONResponse(content={"status": "ok", "message": "SignalBotAI is alive"})
 # -----------------------------
 # Background signal monitor
 async def monitor_signals():
