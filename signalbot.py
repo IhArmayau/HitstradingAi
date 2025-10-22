@@ -59,6 +59,7 @@ class IndicatorsConfig:
     atr_tp_mult: float = float(os.getenv("ATR_TP_MULT", 3.0))
     atr_sl_mult: float = float(os.getenv("ATR_SL_MULT", 1.5))
 
+
 @dataclass
 class BotConfig:
     symbols: List[str] = field(default_factory=lambda: [
@@ -70,7 +71,7 @@ class BotConfig:
     timeframe: str = os.getenv("TIMEFRAME", "5m")  # Entry TF
     higher_timeframe: str = os.getenv("HIGHER_TIMEFRAME", "1h")  # Confirmation 1H
     htf_4h: str = os.getenv("HTF_4H", "4h")  # Confirmation 4H
-    limit: int = int(os.getenv("LIMIT", 500))
+    limit: int = int(os.getenv("LIMIT", 1000))
     poll_interval: int = int(os.getenv("POLL_INTERVAL", 300))
     sqlite_db: str = os.getenv("SQLITE_DB", "signals.db")
     confidence_threshold: float = float(os.getenv("CONFIDENCE_THRESHOLD", 70.0))
@@ -85,8 +86,9 @@ class BotConfig:
     min_samples_for_retrain: int = int(os.getenv("MIN_SAMPLES_FOR_RETRAIN", 500))
     onchain_api_url: Optional[str] = os.getenv("ONCHAIN_API_URL")
     simulate_execution: bool = os.getenv("SIMULATE_EXECUTION", "true").lower() in ("1", "true", "yes")
+
 # -----------------------------
-# Database (signals + training dataset + perf)
+# Database (signals + training dataset + performance)
 # -----------------------------
 class SignalStore:
     def __init__(self, db_path: str):
@@ -152,7 +154,10 @@ class SignalStore:
         await self.conn.execute("""
             INSERT INTO signals(timestamp, symbol, signal, entry, sl, tp, confidence, rr, pred_prob, model_version, executed_price)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (sig['timestamp'], sig['symbol'], sig['signal'], sig['entry'], sig['sl'], sig['tp'], sig['confidence'], sig['rr'], sig['pred_prob'], sig['model_version'], sig['executed_price']))
+        """, (
+            sig['timestamp'], sig['symbol'], sig['signal'], sig['entry'], sig['sl'], sig['tp'],
+            sig['confidence'], sig['rr'], sig['pred_prob'], sig['model_version'], sig['executed_price']
+        ))
         await self.conn.commit()
         logger.debug("Inserted signal for %s: %s", sig['symbol'], sig['signal'])
 
@@ -191,7 +196,9 @@ class SignalStore:
         if not ids:
             return
         placeholders = ','.join(['?']*len(ids))
-        await self.conn.execute(f"UPDATE training SET used_in_model=1 WHERE id IN ({placeholders})", ids)
+        await self.conn.execute(
+            f"UPDATE training SET used_in_model=1 WHERE id IN ({placeholders})", ids
+        )
         await self.conn.commit()
 
     async def close(self):
@@ -235,7 +242,7 @@ def format_signal_message(signals: List[Dict]) -> str:
         rr_visual = rr_bar(s.get("rr", 0.0))
         lines.append(f"{icon} *{s['signal']}* `{escape_telegram_markdown(s['symbol'])}`")
         lines.append(f"• Entry: `{fmt_price(s['entry'])}`  SL: `{fmt_price(s['sl'])}`  TP: `{fmt_price(s['tp'])}`")
-        lines.append(f"• R:R: `{s.get('rr',0):.2f}` {rr_visual}  Confidence: `{s['confidence']:.2f}%`")
+        lines.append(f"• R:R: `{s.get('rr', 0):.2f}` {rr_visual}  Confidence: `{s['confidence']:.2f}%`")
         lines.append("━━━━━━━━━━━━━━")
     return "\n".join(lines)
 
@@ -256,6 +263,7 @@ async def send_telegram_message(bot_token: str, chat_id: str, message: str):
 
 # -----------------------------
 # Feature Engineering
+# -----------------------------
 FEATURE_LIST = [
     'ema_short', 'ema_medium', 'ema_long', 'rsi', 'atr', 'adx', 'bb_trend',
     'vol_ok', 'htf_trend', 'spread_pct', 'ob_imbalance', 'bid_depth', 'ask_depth',
@@ -279,10 +287,12 @@ def add_indicators(df: pd.DataFrame, ind_cfg: IndicatorsConfig, df_htf: Optional
         df['rsi'] = ta.momentum.RSIIndicator(df['close'], ind_cfg.rsi_period).rsi()
     except Exception:
         df['rsi'] = np.nan
+
     try:
         df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], ind_cfg.atr_period).average_true_range()
     except Exception:
         df['atr'] = np.nan
+
     try:
         df['adx'] = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], ind_cfg.atr_period).adx()
     except Exception:
@@ -314,6 +324,7 @@ def add_indicators(df: pd.DataFrame, ind_cfg: IndicatorsConfig, df_htf: Optional
 
 # -----------------------------
 # ML / Model Utilities
+# -----------------------------
 class MLModelManager:
     def __init__(self, model_path: str, feature_list: List[str], model_version: str = "v2"):
         self.model_path = model_path
@@ -390,9 +401,11 @@ class MLModelManager:
             samples = await store.fetch_training_samples(cfg.min_samples_for_retrain)
             if len(samples) < cfg.min_samples_for_retrain:
                 continue
+
             X = []
             y = []
             ids = []
+
             for s in samples:
                 try:
                     feats = json.loads(s['features'])
@@ -401,10 +414,13 @@ class MLModelManager:
                     ids.append(s['id'])
                 except Exception:
                     continue
+
             if not X:
                 continue
+
             X = np.array(X)
             y = np.array(y)
+
             X_scaled = self.scale_features(symbol, X, fit=True)
             model = RandomForestClassifier(n_estimators=100, random_state=42)
             model.fit(X_scaled, y)
@@ -415,6 +431,7 @@ class MLModelManager:
 
 # -----------------------------
 # Signal Generation
+# -----------------------------
 class SignalGenerator:
     def __init__(self, cfg: BotConfig, store: SignalStore, ml_mgr: MLModelManager, exchange: ccxt.kucoinfutures):
         self.cfg = cfg
@@ -455,7 +472,7 @@ class SignalGenerator:
         # Placeholder if using onchain metrics
         return 0.0
 
-def simulate_execution_price(self, entry: float, ob_feats: dict, signal_type: str) -> float:
+    def simulate_execution_price(self, entry: float, ob_feats: dict, signal_type: str) -> float:
         slippage = entry * self.cfg.expected_slippage_pct
         return entry + slippage if signal_type == "BUY" else entry - slippage
 
@@ -491,6 +508,7 @@ def simulate_execution_price(self, entry: float, ob_feats: dict, signal_type: st
                     signal_type = "BUY"
                 elif last['close'] < last['ema_short'] < last['ema_medium'] and not confirm_1h and not confirm_4h:
                     signal_type = "SELL"
+
                 if not signal_type:
                     return
 
@@ -524,6 +542,7 @@ def simulate_execution_price(self, entry: float, ob_feats: dict, signal_type: st
 
                 entry_exec = self.simulate_execution_price(entry, ob_feats, signal_type) \
                     if self.cfg.simulate_execution else entry
+
                 if signal_type == "BUY":
                     sl = entry_exec - atr * self.cfg.indicators.atr_sl_mult
                     tp = entry_exec + atr * self.cfg.indicators.atr_tp_mult
@@ -564,6 +583,7 @@ def simulate_execution_price(self, entry: float, ob_feats: dict, signal_type: st
 
 # -----------------------------
 # FastAPI App & Heartbeat
+# -----------------------------
 app = FastAPI()
 cfg = BotConfig()
 store = SignalStore(cfg.sqlite_db)
@@ -617,6 +637,7 @@ async def heartbeat():
 
 # -----------------------------
 # Background signal monitor
+# -----------------------------
 async def monitor_signals():
     while True:
         try:
@@ -629,6 +650,7 @@ async def monitor_signals():
 
 # -----------------------------
 # Run Uvicorn if executed directly
+# -----------------------------
 if __name__ == "__main__":
     uvicorn.run(
         app,
