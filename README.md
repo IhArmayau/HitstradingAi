@@ -1,6 +1,6 @@
-# SignalBotAI SignalBotAI
+# HitstradingAI
  
-SignalBotAI is an intelligent cryptocurrency signal generation bot using technical indicators and machine learning. It supports automated signal generation, Telegram notifications, and background monitoring for multiple trading pairs.
+HitstradingAI is an intelligent signal generation bot using technical indicators and machine learning. It supports automated signal generation, Telegram notifications, and background monitoring for multiple trading pairs.
   
 ## 📂 Project Structure
  `~/SignalBotAI ├── data/                # SQLite DB & historical OHLCV data ├── logs/                # Bot logs (e.g., signalbot.log) ├── models/              # Saved ML models & scalers ├── requirements.txt     # Python dependencies ├── signalbot.py         # Main bot logic: indicators, ML, signal generation ├── telegram.py          # Telegram messaging utilities └── start.sh             # Script to launch the bot `  
