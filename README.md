@@ -199,6 +199,11 @@ SignalBotAI Telegram Signal Example Signals sent directly to Telegram with R:R a
 4. Push to the branch (`git push origin feature-name`)
  
 5. Open a Pull Request
+
+6. ## 📜 Certifications & Pitch Deck  
+
+- 🎓 Certificate: [View My Certificate](https://drive.google.com/file/d/1jzdiDHpVrFDwFZiImFkkyLJrSu6J8wfh/view?usp=drivesdk)  
+- 💼 Pitch Deck: [View My Pitch Deck](https://drive.google.com/file/d/1jVSbtGlEUZBaexCIprhwi_qsj6kuapnK/view?usp=drivesdk)
  
 
   
