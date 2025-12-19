@@ -153,7 +153,6 @@ class SignalStore:
                     await self.conn.execute(
                         "UPDATE signals SET status=? WHERE id=?", (new_status, signal_id)
                     )
-                    # Notify Telegram about status change
                     async with self.conn.execute("SELECT * FROM signals WHERE id=?", (signal_id,)) as c2:
                         full_signal = await c2.fetchone()
                         if full_signal:
@@ -188,7 +187,7 @@ def fmt_price(x: float) -> str:
         return f"{x:.4f}"
     return f"{x:.8f}"
 
-def escape_telegram_markdown(text: str) -> str:
+def escape_telegram_markdown_v2(text: str) -> str:
     escape_chars = r"_*[]()~`>#+-=|{}.!\\"
     return ''.join(f"\\{c}" if c in escape_chars else c for c in text)
 
@@ -210,13 +209,13 @@ async def notify_signal_update(signal: dict):
     if cfg.telegram_bot_token and cfg.telegram_chat_id:
         msg = (
             f"*🔄 Signal Update*\n"
-            f"*Pair:* `{escape_telegram_markdown(signal['symbol'])}`\n"
+            f"*Pair:* `{escape_telegram_markdown_v2(signal['symbol'])}`\n"
             f"*Signal:* {'🟢 BUY' if signal['signal']=='BUY' else '🔴 SELL'}\n"
             f"*Entry:* `{fmt_price(signal['entry'])}`\n"
-            f"*SL:* `{fmt_price(signal['sl'])}` | *TP:* `{fmt_price(signal['tp'])}`\n"
+            f"*SL:* `{fmt_price(signal['sl'])}` \\| *TP:* `{fmt_price(signal['tp'])}`\n"
             f"*R:R:* `{signal['rr']:.2f} {rr_bar(signal['rr'])}`\n"
             f"*Confidence:* `{signal['confidence']:.2f}%`\n"
-            f"*Status:* `{signal.get('status', 'open')}`\n"
+            f"*Status:* `{escape_telegram_markdown_v2(signal.get('status', 'open'))}`\n"
             f"────────────────────────"
         )
         await send_telegram_message(cfg.telegram_bot_token, cfg.telegram_chat_id, msg)
@@ -260,6 +259,7 @@ def add_indicators(df: pd.DataFrame, ind_cfg: IndicatorsConfig, df_htf: Optional
         df['htf_trend'] = 0
     return df.reset_index(drop=True)
 
+
 # -----------------------------
 # ML Model Manager
 # -----------------------------
@@ -299,6 +299,8 @@ class MLModelManager:
         else:
             X_scaled = self.scalers[symbol].transform(X)
         return X_scaled
+
+
 # -----------------------------
 # Signal Generator
 # -----------------------------
@@ -335,7 +337,6 @@ class SignalGenerator:
                 if await self.store.has_open_signal(symbol):
                     return
 
-                # EMA crossover signal
                 signal_type = None
                 if last['ema_short'] > last['ema_medium']:
                     signal_type = "BUY"
@@ -383,10 +384,10 @@ class SignalGenerator:
                 if self.cfg.telegram_bot_token and self.cfg.telegram_chat_id:
                     msg = (
                         f"*📊 New Signal from SignalBotAI*\n"
-                        f"*Pair:* `{escape_telegram_markdown(sig['symbol'])}`\n"
+                        f"*Pair:* `{escape_telegram_markdown_v2(sig['symbol'])}`\n"
                         f"*Signal:* {'🟢 BUY' if signal_type=='BUY' else '🔴 SELL'}\n"
                         f"*Entry:* `{fmt_price(sig['entry'])}`\n"
-                        f"*SL:* `{fmt_price(sig['sl'])}` | *TP:* `{fmt_price(sig['tp'])}`\n"
+                        f"*SL:* `{fmt_price(sig['sl'])}` \\| *TP:* `{fmt_price(sig['tp'])}`\n"
                         f"*R:R:* `{sig['rr']:.2f} {rr_bar(sig['rr'])}`\n"
                         f"*Confidence:* `{sig['confidence']:.2f}%`\n"
                         f"────────────────────────"
@@ -399,6 +400,7 @@ class SignalGenerator:
 # -----------------------------
 app = FastAPI()
 cfg = BotConfig()
+store = SignalStore
 store = SignalStore(cfg.sqlite_db)
 ml_mgr = MLModelManager(cfg.ml_model_path, FEATURE_LIST)
 exchange = ccxt.kucoinfutures({"enableRateLimit": True})
@@ -485,7 +487,7 @@ async def get_signals(limit: int = 50):
 # -----------------------------
 if __name__ == "__main__":
     uvicorn.run(
-        "main:app",  # Adjust if your script filename is different
+        "signalbot:app",  # Make sure this matches your filename if it's different
         host="0.0.0.0",
         port=int(os.getenv("PORT", 8000)),
         log_level="info",
