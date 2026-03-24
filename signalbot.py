@@ -15,7 +15,8 @@ from datetime import datetime, timezone, timedelta
 import numpy as np
 import aiohttp
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.templating import Jinja2Templates
 import uvicorn
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
@@ -90,6 +91,14 @@ class SignalStore:
             )
         """)
         await self.conn.commit()
+
+    async def get_recent_signals(self, limit: int = 5):
+        """NEW: Fetches the latest signals for the landing page."""
+        if not self.conn: await self.init_db()
+        query = "SELECT symbol, signal, entry, confidence, status, timestamp FROM signals ORDER BY id DESC LIMIT ?"
+        async with self.conn.execute(query, (limit,)) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(zip([col[0] for col in cursor.description], row)) for row in rows]
 
     async def has_open_signal(self, symbol: str) -> bool:
         async with self.conn.execute("SELECT 1 FROM signals WHERE symbol=? AND status='open' LIMIT 1", (symbol,)) as cursor:
@@ -281,7 +290,6 @@ def add_indicators(df: pd.DataFrame, ind_cfg: IndicatorsConfig) -> pd.DataFrame:
     return df
 
 async def set_bot_commands(token: str):
-    """Registers the command menu with Telegram UI."""
     url = f"https://api.telegram.org/bot{token}/setMyCommands"
     commands = [
         {"command": "status", "description": "📊 View dashboard & live stats"},
@@ -333,7 +341,9 @@ async def send_heartbeat(generator: SignalGenerator, cfg: BotConfig):
 async def telegram_polling_loop(generator: SignalGenerator, cfg: BotConfig):
     if not cfg.telegram_bot_token: return
     await set_bot_commands(cfg.telegram_bot_token)
-    offset, url = 0, f"https://api.telegram.org/bot{cfg.telegram_bot_token}/getUpdates"
+    offset = 0
+    url = f"https://api.telegram.org/bot{cfg.telegram_bot_token}/getUpdates"
+    
     async with aiohttp.ClientSession() as session:
         while True:
             try:
@@ -343,16 +353,15 @@ async def telegram_polling_loop(generator: SignalGenerator, cfg: BotConfig):
                         for update in data.get("result", []):
                             offset = update["update_id"] + 1
                             msg_obj = update.get("message", {})
-                            text = msg_obj.get("text", "").lower().strip()
+                            raw_text = msg_obj.get("text", "").lower().strip()
                             chat_id = str(msg_obj.get("chat", {}).get("id", ""))
-                            
-                            if chat_id == cfg.telegram_chat_id:
-                                if text in ["/start", "/help"]:
-                                    await send_help_guide(cfg.telegram_bot_token, chat_id)
-                                elif text == "/status":
-                                    await send_heartbeat(generator, cfg)
-                                elif text.startswith("/set"):
-                                    parts = text.split(" ")
+                            text = raw_text.replace("/", "")
+
+                            if chat_id == str(cfg.telegram_chat_id):
+                                if text in ["start", "help"]: await send_help_guide(cfg.telegram_bot_token, chat_id)
+                                elif text == "status": await send_heartbeat(generator, cfg)
+                                elif text.startswith("set"):
+                                    parts = raw_text.split(" ")
                                     if len(parts) == 3:
                                         param, val = parts[1], parts[2]
                                         try:
@@ -360,7 +369,6 @@ async def telegram_polling_loop(generator: SignalGenerator, cfg: BotConfig):
                                                 if val in ['1m', '3m', '5m', '15m', '1h', '4h']:
                                                     cfg.timeframe = val
                                                     await send_tg(cfg.telegram_bot_token, chat_id, f"✅ Entry TF updated to {val}")
-                                                else: await send_tg(cfg.telegram_bot_token, chat_id, "❌ Invalid Timeframe")
                                             elif param == "poll":
                                                 cfg.poll_interval = int(val)
                                                 await send_tg(cfg.telegram_bot_token, chat_id, f"✅ Poll interval set to {val}s")
@@ -370,9 +378,9 @@ async def telegram_polling_loop(generator: SignalGenerator, cfg: BotConfig):
                                             elif param == "adx":
                                                 cfg.indicators.adx_threshold = int(val)
                                                 await send_tg(cfg.telegram_bot_token, chat_id, "✅ Min ADX threshold updated")
-                                        except: await send_tg(cfg.telegram_bot_token, chat_id, "❌ Parameter format error.")
-                                elif text.startswith("/pair"):
-                                    parts = text.split(" ")
+                                        except: await send_tg(cfg.telegram_bot_token, chat_id, "❌ Parameter error.")
+                                elif text.startswith("pair"):
+                                    parts = raw_text.split(" ")
                                     if len(parts) == 2 and parts[1] == "list":
                                         await send_tg(cfg.telegram_bot_token, chat_id, "📜 *Active Pairs*:\n" + "\n".join(cfg.symbols))
                                     elif len(parts) == 3:
@@ -383,28 +391,17 @@ async def telegram_polling_loop(generator: SignalGenerator, cfg: BotConfig):
                                                 if symbol not in cfg.symbols:
                                                     cfg.symbols.append(symbol)
                                                     generator.ml_mgr.load_model(symbol)
-                                                    await send_tg(cfg.telegram_bot_token, chat_id, f"✅ {symbol} added to watchlist.")
-                                                else: await send_tg(cfg.telegram_bot_token, chat_id, "⚠️ Pair already active.")
-                                            else: await send_tg(cfg.telegram_bot_token, chat_id, "❌ Asset not found on exchange.")
+                                                    await send_tg(cfg.telegram_bot_token, chat_id, f"✅ {symbol} added.")
                                         elif action == "remove":
                                             if symbol in cfg.symbols:
                                                 cfg.symbols.remove(symbol)
-                                                await send_tg(cfg.telegram_bot_token, chat_id, f"❌ Removed {symbol} from scan list.")
-            except: pass
+                                                await send_tg(cfg.telegram_bot_token, chat_id, f"❌ Removed {symbol}.")
+            except Exception as e: logger.error(f"Telegram Loop Error: {e}")
             await asyncio.sleep(2)
 
 async def notify_new_signal(sig):
     if not cfg.telegram_bot_token: return
-    msg = (
-        f"🚀 *New AI Trading Signal*\n\n"
-        f"Pair: `{sig['symbol']}`\n"
-        f"Direction: *{sig['signal']}*\n"
-        f"Entry: {sig['entry']}\n"
-        f"Stop Loss: {sig['sl']}\n"
-        f"Take Profit: {sig['tp']}\n\n"
-        f"AI Confidence: {sig['confidence']:.1f}%\n"
-        f"Liquidity Score: {sig['features']['liquidity_score']:.3f}%"
-    )
+    msg = (f"🚀 *New AI Trading Signal*\n\nPair: `{sig['symbol']}`\nDirection: *{sig['signal']}*\nEntry: {sig['entry']}\nAI Confidence: {sig['confidence']:.1f}%")
     await send_tg(cfg.telegram_bot_token, cfg.telegram_chat_id, msg)
 
 async def notify_signal_update(sig):
@@ -420,7 +417,7 @@ async def send_tg(token, cid, msg):
 
 async def train_models_task(generator, cfg):
     while True:
-        await asyncio.sleep(86400) # Daily retraining
+        await asyncio.sleep(86400)
         X_glob, y_glob = await generator.store.get_training_data()
         if len(y_glob) >= cfg.min_train_samples:
             try:
@@ -431,7 +428,7 @@ async def train_models_task(generator, cfg):
             except: pass
 
 # -----------------------------
-# Lifecycle
+# Lifecycle & Web Routes
 # -----------------------------
 app = FastAPI()
 cfg = BotConfig()
@@ -439,6 +436,24 @@ store = SignalStore(cfg.sqlite_db)
 ml_mgr = MLModelManager(cfg.ml_model_path)
 exchange = ccxt.kucoinfutures({"enableRateLimit": True, "options": {"defaultType": "future"}})
 generator = SignalGenerator(cfg, store, ml_mgr, exchange)
+
+# Set up templates folder
+templates = Jinja2Templates(directory="templates")
+
+@app.get("/")
+async def root(request: Request):
+    """SaaS Landing Page with Live Signal Feed."""
+    recent_signals = await store.get_recent_signals(5)
+    return templates.TemplateResponse("index.html", {
+        "request": request,
+        "active_pairs": len(cfg.symbols),
+        "timeframe": cfg.timeframe,
+        "signals": recent_signals
+    })
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
 
 async def background_monitor():
     while True:
@@ -455,13 +470,17 @@ async def background_monitor():
 async def startup():
     await store.init_db()
     for _ in range(3):
-        try: await exchange.load_markets(); break
+        try: 
+            await exchange.load_markets()
+            break
         except: await asyncio.sleep(5)
     for s in cfg.symbols: ml_mgr.load_model(s)
+    
     asyncio.create_task(background_monitor())
     asyncio.create_task(telegram_polling_loop(generator, cfg))
     asyncio.create_task(train_models_task(generator, cfg))
-    logger.info("SignalBotAI SaaS: Online and Scanning for Opportunities.")
+    logger.info("SignalBotAI SaaS: Online.")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)

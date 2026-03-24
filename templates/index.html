@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SignalBotAI | Institutional Grade Crypto Signals</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <style>
+        .gradient-text {
+            background: linear-gradient(90deg, #3b82f6, #10b981);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .glass {
+            background: rgba(255, 255, 255, 0.03);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        html {
+            scroll-behavior: smooth;
+        }
+    </style>
+</head>
+<body class="bg-slate-950 text-white font-sans selection:bg-blue-500/30">
+
+    <nav class="p-6 flex justify-between items-center max-w-7xl mx-auto sticky top-0 z-50 bg-slate-950/80 backdrop-blur-md">
+        <div class="text-2xl font-bold tracking-tighter uppercase">SignalBot<span class="text-blue-500 font-black italic">AI</span></div>
+        <div class="space-x-8 hidden md:flex text-sm font-medium text-slate-400">
+            <a href="#features" class="hover:text-white transition">Features</a>
+            <a href="#live-feed" class="hover:text-white transition">Live Feed</a>
+            <a href="#pricing" class="hover:text-white transition">Pricing</a>
+        </div>
+        <a href="https://t.me/Hitstrading_bot" class="bg-blue-600 hover:bg-blue-700 px-6 py-2 rounded-full text-sm font-bold transition shadow-lg shadow-blue-600/20">Get Started</a>
+    </nav>
+
+    <header class="py-24 px-6 text-center max-w-4xl mx-auto">
+        <h1 class="text-5xl md:text-7xl font-extrabold mb-8 tracking-tight">
+            Trade with <span class="gradient-text">Machine Intelligence</span>
+        </h1>
+        <p class="text-lg text-slate-400 mb-10 leading-relaxed max-w-2xl mx-auto">
+            Real-time algorithmic signals for BTC, ETH, and SOL. Powered by Random Forest Classifiers and multi-timeframe technical analysis.
+        </p>
+        <div class="flex justify-center">
+            <div class="glass p-4 rounded-2xl flex items-center gap-3">
+                <span class="relative flex h-3 w-3">
+                  <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+                  <span class="relative inline-flex rounded-full h-3 w-3 bg-green-500"></span>
+                </span>
+                <span class="text-sm font-mono text-slate-300">Scanning {{ active_pairs }} pairs on {{ timeframe }} timeframe</span>
+            </div>
+        </div>
+    </header>
+
+    <section id="features" class="max-w-7xl mx-auto px-6 py-12 grid md:grid-cols-3 gap-8 text-center">
+        <div class="glass p-8 rounded-3xl">
+            <i class="fa-solid fa-microchip text-blue-500 text-3xl mb-4"></i>
+            <h3 class="text-xl font-bold mb-2">ML Refinement</h3>
+            <p class="text-slate-400 text-sm leading-relaxed">Every signal is validated by a Random Forest model trained on 24h market volatility data.</p>
+        </div>
+        <div class="glass p-8 rounded-3xl border-blue-500/20">
+            <i class="fa-solid fa-bolt text-yellow-500 text-3xl mb-4"></i>
+            <h3 class="text-xl font-bold mb-2">Low Latency</h3>
+            <p class="text-slate-400 text-sm leading-relaxed">Sub-second execution logic ensuring you receive signals the moment the algorithm triggers.</p>
+        </div>
+        <div class="glass p-8 rounded-3xl">
+            <i class="fa-brands fa-telegram text-sky-400 text-3xl mb-4"></i>
+            <h3 class="text-xl font-bold mb-2">Instant Alerts</h3>
+            <p class="text-slate-400 text-sm leading-relaxed">Direct-to-Telegram delivery with dynamic Entry, SL, TP, and AI Confidence scores.</p>
+        </div>
+    </section>
+
+    <section id="live-feed" class="max-w-7xl mx-auto px-6 py-12">
+        <div class="glass p-8 rounded-[2rem]">
+            <h2 class="text-2xl font-bold mb-6">Live Signal Feed</h2>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left">
+                    <thead>
+                        <tr class="text-slate-500 text-xs uppercase border-b border-white/10">
+                            <th class="pb-4">Asset</th>
+                            <th class="pb-4">Signal</th>
+                            <th class="pb-4">Entry</th>
+                            <th class="pb-4">Confidence</th>
+                            <th class="pb-4">Status</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-white/5">
+                        {% if signals %}
+                            {% for sig in signals %}
+                            <tr class="hover:bg-white/5 transition-colors">
+                                <td class="py-4 font-bold">{{ sig.symbol }}</td>
+                                <td class="py-4">
+                                    <span class="px-2 py-1 rounded text-[10px] font-bold {{ 'bg-green-500/10 text-green-500' if sig.signal == 'BUY' else 'bg-red-500/10 text-red-500' }}">
+                                        {{ sig.signal }}
+                                    </span>
+                                </td>
+                                <td class="py-4 font-mono text-slate-300">${{ sig.entry }}</td>
+                                <td class="py-4 text-blue-400 font-medium">{{ sig.confidence|round(1) }}%</td>
+                                <td class="py-4 uppercase text-[10px] text-slate-500">{{ sig.status.replace('_', ' ') }}</td>
+                            </tr>
+                            {% endfor %}
+                        {% else %}
+                            <tr><td colspan="5" class="py-12 text-center text-slate-600 italic">Scanning the markets... Waiting for the next AI trigger.</td></tr>
+                        {% endif %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </section>
+
+    <section id="pricing" class="max-w-7xl mx-auto px-6 py-20 text-center">
+        <h2 class="text-4xl font-bold mb-12">Simple, Transparent Pricing</h2>
+        <div class="grid md:grid-cols-2 gap-8 max-w-4xl mx-auto">
+            <div class="glass p-10 rounded-3xl text-left border-white/5">
+                <h4 class="text-xl font-bold mb-2">Starter</h4>
+                <div class="text-4xl font-black mb-6">$0<span class="text-sm font-normal text-slate-500">/mo</span></div>
+                <ul class="space-y-4 text-sm text-slate-400 mb-10">
+                    <li><i class="fa-solid fa-check text-blue-500 mr-2"></i> Limited Asset Scanning</li>
+                    <li><i class="fa-solid fa-check text-blue-500 mr-2"></i> Basic Telegram Alerts</li>
+                    <li><i class="fa-solid fa-check text-blue-500 mr-2"></i> Standard Latency</li>
+                </ul>
+                <button class="w-full py-3 rounded-xl border border-white/10 font-bold hover:bg-white/5 transition">Current Plan</button>
+            </div>
+            <div class="glass p-10 rounded-3xl text-left border-blue-500/50 bg-blue-500/5 shadow-2xl shadow-blue-500/10">
+                <h4 class="text-xl font-bold mb-2">Pro Trader</h4>
+                <div class="text-4xl font-black mb-6">$29<span class="text-sm font-normal text-slate-500">/mo</span></div>
+                <ul class="space-y-4 text-sm text-slate-400 mb-10">
+                    <li><i class="fa-solid fa-check text-blue-500 mr-2"></i> All Crypto Assets (BTC, ETH, SOL+)</li>
+                    <li><i class="fa-solid fa-check text-blue-500 mr-2"></i> AI Confidence Scores</li>
+                    <li><i class="fa-solid fa-check text-blue-500 mr-2"></i> Instant Priority Alerts</li>
+                    <li><i class="fa-solid fa-check text-blue-500 mr-2"></i> Market Health Indicators</li>
+                </ul>
+                <a href="https://t.me/Hitstrading_bot" class="block w-full py-3 rounded-xl bg-blue-600 font-bold text-center hover:bg-blue-700 transition shadow-lg shadow-blue-600/30">Upgrade Now</a>
+            </div>
+        </div>
+    </section>
+
+    <footer class="py-20 border-t border-white/5 text-center text-slate-500">
+        <div class="text-xl font-bold text-white mb-4">SignalBot<span class="text-blue-500">AI</span></div>
+        <p class="max-w-xs mx-auto text-xs leading-relaxed mb-8">
+            Trading involves significant risk. The signals provided are for informational purposes only.
+        </p>
+        <div class="text-[10px] uppercase tracking-widest">
+            &copy; 2026 SignalBotAI SaaS &bull; Powered by @Hitstrading_bot
+        </div>
+    </footer>
+
+</body>
+</html>
