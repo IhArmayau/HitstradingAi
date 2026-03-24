@@ -11,3 +11,5 @@ fastapi
 uvicorn[standard]
 scikit-learn
 tensorflow
+jinja2
+python-multipart
