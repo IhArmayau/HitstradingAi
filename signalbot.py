@@ -232,23 +232,22 @@ class SignalGenerator:
 # -----------------------------
 async def send_heartbeat(generator: SignalGenerator, cfg: BotConfig):
     btc_bullish = await generator.get_btc_health()
-    market_filter = "🟢 BULLISH (Active)" if btc_bullish else "🔴 BEARISH (Paused)"
+    market_filter = "BULLISH (Active)" if btc_bullish else "BEARISH (Paused)"
     
-    # Check volatility on first symbol
     df = await generator.fetch_candles(cfg.symbols[0], cfg.timeframe)
     df_ind = add_indicators(df, cfg.indicators)
     adx = df_ind['adx'].iloc[-1] if not df_ind.empty else 0
-    vol_status = "⚡ Trending" if adx >= cfg.indicators.adx_threshold else "💤 Choppy"
+    vol_status = "Trending" if adx >= cfg.indicators.adx_threshold else "Choppy"
 
     msg = (
-        f"🤖 *Bot Status Report*\n"
-        f"────────────────────────\n"
-        f"✅ *Status:* `Running`\n"
-        f"📈 *Market:* {market_filter}\n"
-        f"📊 *Volatility:* {vol_status} `({adx:.1f})`\n"
-        f"🔍 *Pairs:* `{len(cfg.symbols)}` active\n"
-        f"────────────────────────\n"
-        f"_Time: {datetime.now().strftime('%H:%M:%S')} UTC_"
+        f"🤖 Bot Status Report\n"
+        f"------------------------\n"
+        f"Status: Running\n"
+        f"Market: {market_filter}\n"
+        f"Volatility: {vol_status} ({adx:.1f})\n"
+        f"Pairs: {len(cfg.symbols)} active\n"
+        f"------------------------\n"
+        f"Time: {datetime.now().strftime('%H:%M:%S')} UTC"
     )
     await send_tg(cfg.telegram_bot_token, cfg.telegram_chat_id, msg)
 
@@ -274,33 +273,16 @@ async def telegram_polling_loop(generator: SignalGenerator, cfg: BotConfig):
                         for update in data.get("result", []):
                             offset = update["update_id"] + 1
                             message = update.get("message", {})
-                            text = message.get("text", "")
+                            text = message.get("text", "").lower().strip() # Case insensitive
                             chat_id = str(message.get("chat", {}).get("id", ""))
                             
-                            if chat_id == cfg.telegram_chat_id and text.lower() == "/status":
+                            # Triggers if the message contains "status" (Handles /status, /Status, Send status)
+                            if chat_id == cfg.telegram_chat_id and "status" in text:
+                                logger.info("Status command received!")
                                 await send_heartbeat(generator, cfg)
             except Exception as e:
                 logger.error(f"Telegram polling error: {e}")
             await asyncio.sleep(2)
-
-# -----------------------------
-# Training Task
-# -----------------------------
-async def train_models_periodically():
-    while True:
-        logger.info("Starting scheduled ML retraining...")
-        for symbol in cfg.symbols:
-            X, y = await store.get_training_data(symbol)
-            if len(y) >= cfg.min_train_samples:
-                try:
-                    scaler = StandardScaler()
-                    X_scaled = scaler.fit_transform(X)
-                    model = RandomForestClassifier(n_estimators=100, random_state=42)
-                    model.fit(X_scaled, y)
-                    ml_mgr.save_model(symbol, model, scaler)
-                    logger.info(f"Retrained model for {symbol} with {len(y)} samples.")
-                except Exception as e: logger.error(f"Training failed for {symbol}: {e}")
-        await asyncio.sleep(86400)
 
 # -----------------------------
 # Standard Logic & Helpers
@@ -324,21 +306,20 @@ def add_indicators(df: pd.DataFrame, ind_cfg: IndicatorsConfig) -> pd.DataFrame:
 
 async def notify_new_signal(sig):
     if not cfg.telegram_bot_token: return
-    msg = f"*🚀 New AI Signal*\n*Pair:* `{sig['symbol']}`\n*Signal:* `{sig['signal']}`\n*AI Confidence:* `{sig['confidence']:.1f}%`"
+    msg = f"🚀 New AI Signal\nPair: {sig['symbol']}\nSignal: {sig['signal']}\nAI Confidence: {sig['confidence']:.1f}%"
     await send_tg(cfg.telegram_bot_token, cfg.telegram_chat_id, msg)
 
 async def notify_signal_update(sig):
     if not cfg.telegram_bot_token: return
     emoji = "✅" if sig['status'] == 'take_profit' else "❌"
-    msg = f"*{emoji} Signal Closed*\n*Pair:* `{sig['symbol']}`\n*Outcome:* `{sig['status'].upper()}`"
+    msg = f"{emoji} Signal Closed\nPair: {sig['symbol']}\nOutcome: {sig['status'].upper()}"
     await send_tg(cfg.telegram_bot_token, cfg.telegram_chat_id, msg)
 
 async def send_tg(token, cid, msg):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     async with aiohttp.ClientSession() as session:
-        # Clean up Markdown for Telegram V2 compatibility if needed, 
-        # but preserving your existing logic.
-        await session.post(url, json={"chat_id": cid, "text": msg, "parse_mode": "MarkdownV2"})
+        # Simplified: Removing parse_mode to avoid formatting errors
+        await session.post(url, json={"chat_id": cid, "text": msg})
 
 # -----------------------------
 # Lifecycle
@@ -352,12 +333,7 @@ generator = SignalGenerator(cfg, store, ml_mgr, exchange)
 
 @app.get("/")
 async def root():
-    """Satisfies Render's health check ping."""
-    return {
-        "bot_status": "Active",
-        "market_check": "Running",
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
+    return {"bot_status": "Active", "market_check": "Running", "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
 async def background_monitor():
     while True:
@@ -377,13 +353,10 @@ async def startup():
     await exchange.load_markets()
     for s in cfg.symbols: ml_mgr.load_model(s)
     asyncio.create_task(background_monitor())
-    asyncio.create_task(train_models_periodically())
     asyncio.create_task(heartbeat_loop(generator, cfg))
     asyncio.create_task(telegram_polling_loop(generator, cfg))
-    logger.info("SignalBotAI Online: Filters, Heartbeat (4h), and /status Active.")
+    logger.info("SignalBotAI Online.")
 
 if __name__ == "__main__":
-    # Render provides a PORT env var. If not found, default to 8000.
     port = int(os.environ.get("PORT", 8000))
-    # Passing 'app' object ensures the FastAPI routes are handled correctly.
     uvicorn.run(app, host="0.0.0.0", port=port)
