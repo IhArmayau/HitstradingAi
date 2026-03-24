@@ -261,7 +261,6 @@ async def heartbeat_loop(generator: SignalGenerator, cfg: BotConfig):
         await asyncio.sleep(cfg.heartbeat_interval)
 
 async def telegram_polling_loop(generator: SignalGenerator, cfg: BotConfig):
-    """Listens for /status command using Long Polling."""
     if not cfg.telegram_bot_token: return
     offset = 0
     url = f"https://api.telegram.org/bot{cfg.telegram_bot_token}/getUpdates"
@@ -337,6 +336,8 @@ async def notify_signal_update(sig):
 async def send_tg(token, cid, msg):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     async with aiohttp.ClientSession() as session:
+        # Clean up Markdown for Telegram V2 compatibility if needed, 
+        # but preserving your existing logic.
         await session.post(url, json={"chat_id": cid, "text": msg, "parse_mode": "MarkdownV2"})
 
 # -----------------------------
@@ -348,6 +349,15 @@ store = SignalStore(cfg.sqlite_db)
 ml_mgr = MLModelManager(cfg.ml_model_path)
 exchange = ccxt.kucoinfutures({"enableRateLimit": True, "options": {"defaultType": "future"}})
 generator = SignalGenerator(cfg, store, ml_mgr, exchange)
+
+@app.get("/")
+async def root():
+    """Satisfies Render's health check ping."""
+    return {
+        "bot_status": "Active",
+        "market_check": "Running",
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
 
 async def background_monitor():
     while True:
@@ -373,4 +383,7 @@ async def startup():
     logger.info("SignalBotAI Online: Filters, Heartbeat (4h), and /status Active.")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Render provides a PORT env var. If not found, default to 8000.
+    port = int(os.environ.get("PORT", 8000))
+    # Passing 'app' object ensures the FastAPI routes are handled correctly.
+    uvicorn.run(app, host="0.0.0.0", port=port)
