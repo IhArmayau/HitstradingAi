@@ -7,23 +7,25 @@ import ta
 import aiosqlite
 import logging
 import os
+import joblib
+import json
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Any
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import numpy as np
 import aiohttp
-import joblib
 from dotenv import load_dotenv
 from fastapi import FastAPI
 import uvicorn
 from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
 
 # -----------------------------
 # Load environment
 # -----------------------------
 load_dotenv()
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("SignalBotAI")
 
 # -----------------------------
@@ -34,13 +36,14 @@ class IndicatorsConfig:
     ema_short: int = int(os.getenv("EMA_SHORT", 9))
     ema_medium: int = int(os.getenv("EMA_MEDIUM", 21))
     ema_long: int = int(os.getenv("EMA_LONG", 50))
+    ema_filter: int = int(os.getenv("EMA_FILTER", 200))
+    adx_threshold: int = int(os.getenv("ADX_THRESHOLD", 25))
     rsi_period: int = int(os.getenv("RSI_PERIOD", 14))
     atr_period: int = int(os.getenv("ATR_PERIOD", 14))
     bb_period: int = int(os.getenv("BB_PERIOD", 20))
     bb_std: float = float(os.getenv("BB_STD", 2.0))
     atr_tp_mult: float = float(os.getenv("ATR_TP_MULT", 3.0))
     atr_sl_mult: float = float(os.getenv("ATR_SL_MULT", 1.5))
-
 
 @dataclass
 class BotConfig:
@@ -54,18 +57,15 @@ class BotConfig:
     higher_timeframe: str = os.getenv("HIGHER_TIMEFRAME", "1h")
     limit: int = int(os.getenv("LIMIT", 1000))
     poll_interval: int = int(os.getenv("POLL_INTERVAL", 300))
+    heartbeat_interval: int = 14400  # 4 Hours
     sqlite_db: str = os.getenv("SQLITE_DB", "signals.db")
-    confidence_threshold: float = float(os.getenv("CONFIDENCE_THRESHOLD", 70.0))
     max_concurrent_tasks: int = int(os.getenv("MAX_CONCURRENT_TASKS", 5))
     indicators: IndicatorsConfig = field(default_factory=IndicatorsConfig)
     ml_model_path: str = os.getenv("ML_MODEL_PATH", "models")
     telegram_bot_token: Optional[str] = os.getenv("TELEGRAM_BOT_TOKEN")
     telegram_chat_id: Optional[str] = os.getenv("TELEGRAM_CHAT_ID")
     model_version: str = os.getenv("MODEL_VERSION", "v2")
-    expected_slippage_pct: float = float(os.getenv("EXPECTED_SLIPPAGE_PCT", "0.0005"))
-    simulate_execution: bool = os.getenv("SIMULATE_EXECUTION", "true").lower() in ("1", "true", "yes")
-    debug_mode: bool = os.getenv("DEBUG_MODE", "false").lower() in ("1", "true", "yes")
-
+    min_train_samples: int = 20 
 
 # -----------------------------
 # Database / SignalStore
@@ -77,171 +77,241 @@ class SignalStore:
         self.symbol_locks: Dict[str, asyncio.Lock] = {}
 
     async def init_db(self):
-        if self.conn:
-            return
+        if self.conn: return
         db_dir = os.path.dirname(self.db_path) or "."
-        os.makedirs(db_dir, exist_ok=True)
+        if db_dir != ".": os.makedirs(db_dir, exist_ok=True)
         self.conn = await aiosqlite.connect(self.db_path)
         await self.conn.execute("PRAGMA journal_mode=WAL;")
         await self.conn.execute("PRAGMA synchronous=NORMAL;")
         await self.conn.execute("""
             CREATE TABLE IF NOT EXISTS signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT,
-                symbol TEXT,
-                signal TEXT,
-                entry REAL,
-                sl REAL,
-                tp REAL,
-                confidence REAL,
-                rr REAL,
-                outcome TEXT,
-                status TEXT DEFAULT 'open',
-                pred_prob REAL,
-                model_version TEXT,
-                executed_price REAL
+                timestamp TEXT, symbol TEXT, signal TEXT,
+                entry REAL, sl REAL, tp REAL, confidence REAL,
+                rr REAL, status TEXT DEFAULT 'open',
+                feature_json TEXT, model_version TEXT, executed_price REAL
             )
         """)
         await self.conn.commit()
-        logger.info("Database initialized at %s", self.db_path)
 
     async def has_open_signal(self, symbol: str) -> bool:
-        async with self.conn.execute(
-            "SELECT 1 FROM signals WHERE symbol=? AND status='open' LIMIT 1", (symbol,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            return row is not None
+        async with self.conn.execute("SELECT 1 FROM signals WHERE symbol=? AND status='open' LIMIT 1", (symbol,)) as cursor:
+            return await cursor.fetchone() is not None
 
     async def insert_signal(self, sig: dict):
         await self.conn.execute("""
-            INSERT INTO signals(timestamp, symbol, signal, entry, sl, tp, confidence, rr, pred_prob, model_version, executed_price)
+            INSERT INTO signals(timestamp, symbol, signal, entry, sl, tp, confidence, rr, feature_json, model_version, executed_price)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             sig['timestamp'], sig['symbol'], sig['signal'], sig['entry'], sig['sl'], sig['tp'],
-            sig['confidence'], sig['rr'], sig['pred_prob'], sig['model_version'], sig['executed_price']
+            sig['confidence'], sig['rr'], json.dumps(sig['features']), sig['model_version'], sig['executed_price']
         ))
         await self.conn.commit()
-        logger.debug("Inserted signal for %s: %s", sig['symbol'], sig['signal'])
-
-    async def fetch_recent(self, limit: int = 50) -> List[Dict]:
-        async with self.conn.execute(
-            "SELECT * FROM signals ORDER BY timestamp DESC LIMIT ?", (limit,)
-        ) as cursor:
-            rows = await cursor.fetchall()
-            columns = [column[0] for column in cursor.description]
-            return [dict(zip(columns, row)) for row in rows]
 
     async def update_signal_status(self, symbol: str, last_price: float):
-        async with self.conn.execute(
-            "SELECT id, signal, sl, tp, status FROM signals WHERE symbol=? AND status='open'", (symbol,)
-        ) as cursor:
+        async with self.conn.execute("SELECT id, signal, sl, tp FROM signals WHERE symbol=? AND status='open'", (symbol,)) as cursor:
             rows = await cursor.fetchall()
             for row in rows:
-                signal_id, signal_type, sl, tp, status = row
+                sid, stype, sl, tp = row
                 new_status = None
-                if signal_type == "BUY":
-                    if last_price >= tp:
-                        new_status = 'take_profit'
-                    elif last_price <= sl:
-                        new_status = 'stop_loss'
+                if stype == "BUY":
+                    if last_price >= tp: new_status = 'take_profit'
+                    elif last_price <= sl: new_status = 'stop_loss'
                 else:
-                    if last_price <= tp:
-                        new_status = 'take_profit'
-                    elif last_price >= sl:
-                        new_status = 'stop_loss'
+                    if last_price <= tp: new_status = 'take_profit'
+                    elif last_price >= sl: new_status = 'stop_loss'
+                
                 if new_status:
-                    await self.conn.execute(
-                        "UPDATE signals SET status=? WHERE id=?", (new_status, signal_id)
-                    )
-                    async with self.conn.execute("SELECT * FROM signals WHERE id=?", (signal_id,)) as c2:
-                        full_signal = await c2.fetchone()
-                        if full_signal:
-                            columns = [column[0] for column in c2.description]
-                            signal_dict = dict(zip(columns, full_signal))
-                            await notify_signal_update(signal_dict)
-        await self.conn.commit()
+                    await self.conn.execute("UPDATE signals SET status=? WHERE id=?", (new_status, sid))
+                    await self.conn.commit()
+                    async with self.conn.execute("SELECT * FROM signals WHERE id=?", (sid,)) as c2:
+                        res = await c2.fetchone()
+                        if res: await notify_signal_update(dict(zip([col[0] for col in c2.description], res)))
+
+    async def get_training_data(self, symbol: str):
+        async with self.conn.execute(
+            "SELECT feature_json, status FROM signals WHERE symbol=? AND status IN ('take_profit', 'stop_loss')", 
+            (symbol,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            X, y = [], []
+            for feat_json, status in rows:
+                X.append(list(json.loads(feat_json).values()))
+                y.append(1 if status == 'take_profit' else 0)
+            return np.array(X), np.array(y)
 
     async def close(self):
-        if self.conn:
-            await self.conn.close()
-            self.conn = None
-            logger.info("Database connection closed")
+        if self.conn: await self.conn.close()
 
     def get_symbol_lock(self, symbol: str) -> asyncio.Lock:
-        if symbol not in self.symbol_locks:
-            self.symbol_locks[symbol] = asyncio.Lock()
+        if symbol not in self.symbol_locks: self.symbol_locks[symbol] = asyncio.Lock()
         return self.symbol_locks[symbol]
 
-
 # -----------------------------
-# Helpers
+# ML & Generator
 # -----------------------------
-def rr_bar(rr_value: float, max_rr: float = 5.0, length: int = 10) -> str:
-    blocks = min(max(int((rr_value / max_rr) * length), 0), length)
-    return "🟩" * blocks + "⬜" * (length - blocks)
+class MLModelManager:
+    def __init__(self, path: str, version: str = "v2"):
+        self.path, self.version = path, version
+        self.models, self.scalers = {}, {}
+        if not os.path.exists(path): os.makedirs(path)
 
-def fmt_price(x: float) -> str:
-    if x is None:
-        return "0"
-    if abs(x) >= 1:
-        return f"{x:.4f}"
-    return f"{x:.8f}"
-
-def escape_telegram_markdown_v2(text: str) -> str:
-    escape_chars = r"_*[]()~`>#+-=|{}.!\\"
-    return ''.join(f"\\{c}" if c in escape_chars else c for c in text)
-
-async def send_telegram_message(bot_token: str, chat_id: str, message: str):
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": message, "parse_mode": "MarkdownV2"}
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    def load_model(self, symbol: str) -> bool:
+        mf = os.path.join(self.path, f"{symbol.replace('/', '_')}_{self.version}.pkl")
+        sf = os.path.join(self.path, f"{symbol.replace('/', '_')}_{self.version}_scaler.pkl")
         try:
-            async with session.post(url, json=payload) as resp:
-                text = await resp.text()
-                if resp.status != 200:
-                    logger.warning("Telegram send failed %s %s", resp.status, text)
-        except Exception as e:
-            logger.exception("Telegram error: %s", e)
+            if os.path.exists(mf): self.models[symbol] = joblib.load(mf)
+            if os.path.exists(sf): self.scalers[symbol] = joblib.load(sf)
+            return symbol in self.models
+        except: return False
 
+    def save_model(self, symbol: str, model, scaler):
+        mf = os.path.join(self.path, f"{symbol.replace('/', '_')}_{self.version}.pkl")
+        sf = os.path.join(self.path, f"{symbol.replace('/', '_')}_{self.version}_scaler.pkl")
+        joblib.dump(model, mf)
+        joblib.dump(scaler, sf)
+        self.models[symbol] = model
+        self.scalers[symbol] = scaler
 
-async def notify_signal_update(signal: dict):
-    if cfg.telegram_bot_token and cfg.telegram_chat_id:
-        msg = (
-            f"*🔄 Signal Update*\n"
-            f"*Pair:* `{escape_telegram_markdown_v2(signal['symbol'])}`\n"
-            f"*Signal:* {'🟢 BUY' if signal['signal']=='BUY' else '🔴 SELL'}\n"
-            f"*Entry:* `{fmt_price(signal['entry'])}`\n"
-            f"*SL:* `{fmt_price(signal['sl'])}` \\| *TP:* `{fmt_price(signal['tp'])}`\n"
-            f"*R:R:* `{signal['rr']:.2f} {rr_bar(signal['rr'])}`\n"
-            f"*Confidence:* `{signal['confidence']:.2f}%`\n"
-            f"*Status:* `{escape_telegram_markdown_v2(signal.get('status', 'open'))}`\n"
-            f"────────────────────────"
-        )
-        await send_telegram_message(cfg.telegram_bot_token, cfg.telegram_chat_id, msg)
+class SignalGenerator:
+    def __init__(self, cfg: BotConfig, store: SignalStore, ml_mgr: MLModelManager, ex: ccxt.Exchange):
+        self.cfg, self.store, self.ml_mgr, self.exchange = cfg, store, ml_mgr, ex
+        self.semaphore = asyncio.Semaphore(cfg.max_concurrent_tasks)
 
+    async def fetch_candles(self, sym: str, tf: str) -> pd.DataFrame:
+        try:
+            ohlcv = await self.exchange.fetch_ohlcv(sym, timeframe=tf, limit=self.cfg.limit)
+            df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            return df
+        except: return pd.DataFrame()
+
+    async def get_btc_health(self) -> bool:
+        df_btc = await self.fetch_candles("BTC/USDT:USDT", self.cfg.higher_timeframe)
+        if df_btc.empty: return True
+        ema_200 = df_btc['close'].ewm(span=self.cfg.indicators.ema_filter, adjust=False).mean()
+        return float(df_btc['close'].iloc[-1]) > float(ema_200.iloc[-1])
+
+    async def generate_signal(self, symbol: str, btc_bullish: bool):
+        async with self.semaphore:
+            lock = self.store.get_symbol_lock(symbol)
+            async with lock:
+                df = add_indicators(await self.fetch_candles(symbol, self.cfg.timeframe), self.cfg.indicators)
+                if df.empty or await self.store.has_open_signal(symbol): return
+
+                last = df.iloc[-1]
+                if last['adx'] < self.cfg.indicators.adx_threshold: return
+
+                stype = "BUY" if last['ema_short'] > last['ema_medium'] else "SELL" if last['ema_short'] < last['ema_medium'] else None
+                if stype == "BUY" and not btc_bullish: return
+                if not stype: return
+
+                entry, atr = float(last['close']), float(last['atr'] or 0)
+                sl = entry - atr * self.cfg.indicators.atr_sl_mult if stype == "BUY" else entry + atr * self.cfg.indicators.atr_sl_mult
+                tp = entry + atr * self.cfg.indicators.atr_tp_mult if stype == "BUY" else entry - atr * self.cfg.indicators.atr_tp_mult
+
+                features = {f: last[f] for f in FEATURE_LIST}
+                confidence = 50.0 
+                if symbol in self.ml_mgr.models:
+                    try:
+                        X = np.array(list(features.values())).reshape(1, -1)
+                        X_scaled = self.ml_mgr.scalers[symbol].transform(X)
+                        confidence = self.ml_mgr.models[symbol].predict_proba(X_scaled)[0][1] * 100
+                    except: pass
+
+                sig = {
+                    "timestamp": datetime.now(timezone.utc).isoformat(), "symbol": symbol, "signal": stype,
+                    "entry": entry, "sl": sl, "tp": tp, "confidence": confidence, "rr": 2.0,
+                    "features": features, "model_version": self.cfg.model_version, "executed_price": entry,
+                }
+                await self.store.insert_signal(sig)
+                await notify_new_signal(sig)
 
 # -----------------------------
-# Feature list
+# Notification & Heartbeat
 # -----------------------------
-FEATURE_LIST = [
-    'ema_short', 'ema_medium', 'ema_long', 'rsi', 'atr', 'adx', 'bb_trend',
-    'vol_ok', 'htf_trend', 'spread_pct', 'ob_imbalance', 'bid_depth', 'ask_depth',
-    'funding_rate', 'open_interest', 'onchain_flow',
-]
-
-
-# -----------------------------
-# Add Indicators
-# -----------------------------
-def add_indicators(df: pd.DataFrame, ind_cfg: IndicatorsConfig, df_htf: Optional[pd.DataFrame] = None) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
+async def send_heartbeat(generator: SignalGenerator, cfg: BotConfig):
+    btc_bullish = await generator.get_btc_health()
+    market_filter = "🟢 BULLISH (Active)" if btc_bullish else "🔴 BEARISH (Paused)"
     
-    df = df.copy()
-    for c in ['open', 'high', 'low', 'close', 'volume']:
-        df[c] = pd.to_numeric(df[c], errors='coerce')
+    # Check volatility on first symbol
+    df = await generator.fetch_candles(cfg.symbols[0], cfg.timeframe)
+    df_ind = add_indicators(df, cfg.indicators)
+    adx = df_ind['adx'].iloc[-1] if not df_ind.empty else 0
+    vol_status = "⚡ Trending" if adx >= cfg.indicators.adx_threshold else "💤 Choppy"
 
+    msg = (
+        f"🤖 *Bot Status Report*\n"
+        f"────────────────────────\n"
+        f"✅ *Status:* `Running`\n"
+        f"📈 *Market:* {market_filter}\n"
+        f"📊 *Volatility:* {vol_status} `({adx:.1f})`\n"
+        f"🔍 *Pairs:* `{len(cfg.symbols)}` active\n"
+        f"────────────────────────\n"
+        f"_Time: {datetime.now().strftime('%H:%M:%S')} UTC_"
+    )
+    await send_tg(cfg.telegram_bot_token, cfg.telegram_chat_id, msg)
+
+async def heartbeat_loop(generator: SignalGenerator, cfg: BotConfig):
+    await asyncio.sleep(60) 
+    while True:
+        try:
+            await send_heartbeat(generator, cfg)
+        except Exception as e: logger.error(f"Heartbeat error: {e}")
+        await asyncio.sleep(cfg.heartbeat_interval)
+
+async def telegram_polling_loop(generator: SignalGenerator, cfg: BotConfig):
+    """Listens for /status command using Long Polling."""
+    if not cfg.telegram_bot_token: return
+    offset = 0
+    url = f"https://api.telegram.org/bot{cfg.telegram_bot_token}/getUpdates"
+    
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                async with session.get(url, params={"offset": offset, "timeout": 30}) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for update in data.get("result", []):
+                            offset = update["update_id"] + 1
+                            message = update.get("message", {})
+                            text = message.get("text", "")
+                            chat_id = str(message.get("chat", {}).get("id", ""))
+                            
+                            if chat_id == cfg.telegram_chat_id and text.lower() == "/status":
+                                await send_heartbeat(generator, cfg)
+            except Exception as e:
+                logger.error(f"Telegram polling error: {e}")
+            await asyncio.sleep(2)
+
+# -----------------------------
+# Training Task
+# -----------------------------
+async def train_models_periodically():
+    while True:
+        logger.info("Starting scheduled ML retraining...")
+        for symbol in cfg.symbols:
+            X, y = await store.get_training_data(symbol)
+            if len(y) >= cfg.min_train_samples:
+                try:
+                    scaler = StandardScaler()
+                    X_scaled = scaler.fit_transform(X)
+                    model = RandomForestClassifier(n_estimators=100, random_state=42)
+                    model.fit(X_scaled, y)
+                    ml_mgr.save_model(symbol, model, scaler)
+                    logger.info(f"Retrained model for {symbol} with {len(y)} samples.")
+                except Exception as e: logger.error(f"Training failed for {symbol}: {e}")
+        await asyncio.sleep(86400)
+
+# -----------------------------
+# Standard Logic & Helpers
+# -----------------------------
+FEATURE_LIST = ['ema_short', 'ema_medium', 'ema_long', 'rsi', 'atr', 'adx', 'bb_trend', 'vol_ok']
+
+def add_indicators(df: pd.DataFrame, ind_cfg: IndicatorsConfig) -> pd.DataFrame:
+    if df.empty: return df
+    df = df.copy()
+    for c in ['open', 'high', 'low', 'close', 'volume']: df[c] = pd.to_numeric(df[c], errors='coerce')
     df['ema_short'] = df['close'].ewm(span=ind_cfg.ema_short, adjust=False).mean()
     df['ema_medium'] = df['close'].ewm(span=ind_cfg.ema_medium, adjust=False).mean()
     df['ema_long'] = df['close'].ewm(span=ind_cfg.ema_long, adjust=False).mean()
@@ -249,247 +319,58 @@ def add_indicators(df: pd.DataFrame, ind_cfg: IndicatorsConfig, df_htf: Optional
     df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], ind_cfg.atr_period).average_true_range()
     df['adx'] = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], ind_cfg.atr_period).adx()
     bb = ta.volatility.BollingerBands(df['close'], ind_cfg.bb_period, ind_cfg.bb_std)
-    df['bb_middle'] = bb.bollinger_mavg()
-    df['bb_trend'] = np.where(df['close'] > df['bb_middle'], 1, -1)
-    df['vol_avg'] = df['volume'].rolling(20, min_periods=1).mean().fillna(df['volume'].mean())
-    df['vol_ok'] = (df['volume'] > df['vol_avg']).astype(int)
-    if df_htf is not None and not df_htf.empty:
-        df['htf_trend'] = np.where(df_htf['close'].iloc[-1] > df_htf['open'].iloc[-1], 1, -1)
-    else:
-        df['htf_trend'] = 0
-    return df.reset_index(drop=True)
+    df['bb_trend'] = np.where(df['close'] > bb.bollinger_mavg(), 1, -1)
+    df['vol_ok'] = (df['volume'] > df['volume'].rolling(20).mean().fillna(df['volume'].mean())).astype(int)
+    return df
 
+async def notify_new_signal(sig):
+    if not cfg.telegram_bot_token: return
+    msg = f"*🚀 New AI Signal*\n*Pair:* `{sig['symbol']}`\n*Signal:* `{sig['signal']}`\n*AI Confidence:* `{sig['confidence']:.1f}%`"
+    await send_tg(cfg.telegram_bot_token, cfg.telegram_chat_id, msg)
 
-# -----------------------------
-# ML Model Manager
-# -----------------------------
-class MLModelManager:
-    def __init__(self, model_path: str, feature_list: List[str], model_version: str = "v2"):
-        self.model_path = model_path
-        self.feature_list = feature_list
-        self.model_version = model_version
-        self.models: Dict[str, Any] = {}
-        self.scalers: Dict[str, StandardScaler] = {}
+async def notify_signal_update(sig):
+    if not cfg.telegram_bot_token: return
+    emoji = "✅" if sig['status'] == 'take_profit' else "❌"
+    msg = f"*{emoji} Signal Closed*\n*Pair:* `{sig['symbol']}`\n*Outcome:* `{sig['status'].upper()}`"
+    await send_tg(cfg.telegram_bot_token, cfg.telegram_chat_id, msg)
 
-    def _get_model_file(self, symbol: str) -> str:
-        os.makedirs(self.model_path, exist_ok=True)
-        return os.path.join(self.model_path, f"{symbol.replace('/', '_')}_{self.model_version}.pkl")
-
-    def _get_scaler_file(self, symbol: str) -> str:
-        os.makedirs(self.model_path, exist_ok=True)
-        return os.path.join(self.model_path, f"{symbol.replace('/', '_')}_{self.model_version}_scaler.pkl")
-
-    def load_model(self, symbol: str) -> bool:
-        model_file = self._get_model_file(symbol)
-        scaler_file = self._get_scaler_file(symbol)
-        try:
-            if os.path.exists(model_file):
-                self.models[symbol] = joblib.load(model_file)
-            if os.path.exists(scaler_file):
-                self.scalers[symbol] = joblib.load(scaler_file)
-            return symbol in self.models
-        except Exception as e:
-            logger.warning("Failed to load model for %s: %s", symbol, e)
-            return False
-
-    def scale_features(self, symbol: str, X: np.ndarray, fit: bool = False) -> np.ndarray:
-        if symbol not in self.scalers or fit:
-            self.scalers[symbol] = StandardScaler()
-            X_scaled = self.scalers[symbol].fit_transform(X)
-        else:
-            X_scaled = self.scalers[symbol].transform(X)
-        return X_scaled
-
+async def send_tg(token, cid, msg):
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    async with aiohttp.ClientSession() as session:
+        await session.post(url, json={"chat_id": cid, "text": msg, "parse_mode": "MarkdownV2"})
 
 # -----------------------------
-# Signal Generator
-# -----------------------------
-class SignalGenerator:
-    def __init__(self, cfg: BotConfig, store: SignalStore, ml_mgr: MLModelManager, exchange: ccxt.kucoinfutures):
-        self.cfg = cfg
-        self.store = store
-        self.ml_mgr = ml_mgr
-        self.exchange = exchange
-        self.gen_semaphore = asyncio.Semaphore(cfg.max_concurrent_tasks)
-
-    async def fetch_candles(self, symbol: str, timeframe: str) -> pd.DataFrame:
-        try:
-            ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=self.cfg.limit)
-            df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            return df
-        except Exception as e:
-            logger.warning("Failed to fetch candles for %s: %s", symbol, e)
-            return pd.DataFrame()
-
-    async def generate_signal(self, symbol: str):
-        async with self.gen_semaphore:
-            lock = self.store.get_symbol_lock(symbol)
-            async with lock:
-                df_latest = await self.fetch_candles(symbol, self.cfg.timeframe)
-                df_htf = await self.fetch_candles(symbol, self.cfg.higher_timeframe)
-                df = add_indicators(df_latest, self.cfg.indicators, df_htf)
-                if df.empty:
-                    return
-
-                last = df.iloc[-1]
-
-                if await self.store.has_open_signal(symbol):
-                    return
-
-                signal_type = None
-                if last['ema_short'] > last['ema_medium']:
-                    signal_type = "BUY"
-                elif last['ema_short'] < last['ema_medium']:
-                    signal_type = "SELL"
-                if not signal_type:
-                    return
-
-                entry = float(last['close'])
-                atr = float(last['atr'] or 0)
-                if atr <= 0:
-                    return
-
-                sl = entry - atr * self.cfg.indicators.atr_sl_mult if signal_type == "BUY" else entry + atr * self.cfg.indicators.atr_sl_mult
-                tp = entry + atr * self.cfg.indicators.atr_tp_mult if signal_type == "BUY" else entry - atr * self.cfg.indicators.atr_tp_mult
-                rr = abs((tp - entry) / abs(entry - sl)) if entry != sl else 0
-
-                pred_prob = 0.75
-                if symbol in self.ml_mgr.models:
-                    try:
-                        missing_features = [f for f in FEATURE_LIST if f not in df.columns]
-                        if not missing_features:
-                            features = df[FEATURE_LIST].iloc[-1].values.reshape(1, -1)
-                            X_scaled = self.ml_mgr.scale_features(symbol, features)
-                            pred_prob = float(self.ml_mgr.models[symbol].predict_proba(X_scaled)[0][1])
-                    except Exception:
-                        pred_prob = 0.75
-
-                sig = {
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "symbol": symbol,
-                    "signal": signal_type,
-                    "entry": entry,
-                    "sl": sl,
-                    "tp": tp,
-                    "confidence": pred_prob * 100,
-                    "rr": rr,
-                    "pred_prob": pred_prob,
-                    "model_version": self.cfg.model_version,
-                    "executed_price": entry,
-                }
-
-                await self.store.insert_signal(sig)
-
-                if self.cfg.telegram_bot_token and self.cfg.telegram_chat_id:
-                    msg = (
-                        f"*📊 New Signal from SignalBotAI*\n"
-                        f"*Pair:* `{escape_telegram_markdown_v2(sig['symbol'])}`\n"
-                        f"*Signal:* {'🟢 BUY' if signal_type=='BUY' else '🔴 SELL'}\n"
-                        f"*Entry:* `{fmt_price(sig['entry'])}`\n"
-                        f"*SL:* `{fmt_price(sig['sl'])}` \\| *TP:* `{fmt_price(sig['tp'])}`\n"
-                        f"*R:R:* `{sig['rr']:.2f} {rr_bar(sig['rr'])}`\n"
-                        f"*Confidence:* `{sig['confidence']:.2f}%`\n"
-                        f"────────────────────────"
-                    )
-                    await send_telegram_message(self.cfg.telegram_bot_token, self.cfg.telegram_chat_id, msg)
-
-
-# -----------------------------
-# FastAPI Setup
+# Lifecycle
 # -----------------------------
 app = FastAPI()
 cfg = BotConfig()
-store = SignalStore
 store = SignalStore(cfg.sqlite_db)
-ml_mgr = MLModelManager(cfg.ml_model_path, FEATURE_LIST)
-exchange = ccxt.kucoinfutures({"enableRateLimit": True})
+ml_mgr = MLModelManager(cfg.ml_model_path)
+exchange = ccxt.kucoinfutures({"enableRateLimit": True, "options": {"defaultType": "future"}})
 generator = SignalGenerator(cfg, store, ml_mgr, exchange)
 
-
-# -----------------------------
-# Background Monitor
-# -----------------------------
 async def background_monitor():
-    fetch_semaphore = asyncio.Semaphore(cfg.max_concurrent_tasks)
-
-    async def safe_fetch_candles(symbol: str, timeframe: str) -> pd.DataFrame:
-        async with fetch_semaphore:
-            try:
-                df = await generator.fetch_candles(symbol, timeframe)
-                if df.empty:
-                    logger.warning("No candles fetched for %s", symbol)
-                return df
-            except Exception as e:
-                logger.warning("Failed to fetch candles for %s: %s", symbol, e)
-                return pd.DataFrame()
-
     while True:
         try:
-            # Generate signals
-            await asyncio.gather(*(generator.generate_signal(sym) for sym in cfg.symbols), return_exceptions=True)
-
-            # Fetch latest candles
-            fetch_tasks = {sym: asyncio.create_task(safe_fetch_candles(sym, cfg.timeframe)) for sym in cfg.symbols}
-            results = await asyncio.gather(*fetch_tasks.values(), return_exceptions=True)
-
-            # Update signal statuses
-            update_tasks = []
-            for idx, symbol in enumerate(fetch_tasks.keys()):
-                df_latest = results[idx]
-                if isinstance(df_latest, pd.DataFrame) and not df_latest.empty:
-                    last_price = df_latest['close'].iloc[-1]
-                    update_tasks.append(store.update_signal_status(symbol, last_price))
-            await asyncio.gather(*update_tasks, return_exceptions=True)
-
-        except Exception:
-            logger.exception("Unexpected error in background monitor loop")
-
+            df_btc = await generator.fetch_candles("BTC/USDT:USDT", cfg.higher_timeframe)
+            btc_bullish = float(df_btc['close'].iloc[-1]) > float(df_btc['close'].ewm(span=200).mean().iloc[-1]) if not df_btc.empty else True
+            await asyncio.gather(*(generator.generate_signal(s, btc_bullish) for s in cfg.symbols), return_exceptions=True)
+            for s in cfg.symbols:
+                df = await generator.fetch_candles(s, cfg.timeframe)
+                if not df.empty: await store.update_signal_status(s, df['close'].iloc[-1])
+        except Exception as e: logger.error(f"Monitor error: {e}")
         await asyncio.sleep(cfg.poll_interval)
 
-
-# -----------------------------
-# Startup / Shutdown Events
-# -----------------------------
 @app.on_event("startup")
-async def startup_event():
+async def startup():
     await store.init_db()
     await exchange.load_markets()
-    for symbol in cfg.symbols:
-        ml_mgr.load_model(symbol)
+    for s in cfg.symbols: ml_mgr.load_model(s)
     asyncio.create_task(background_monitor())
-    logger.info("SignalBotAI started successfully.")
+    asyncio.create_task(train_models_periodically())
+    asyncio.create_task(heartbeat_loop(generator, cfg))
+    asyncio.create_task(telegram_polling_loop(generator, cfg))
+    logger.info("SignalBotAI Online: Filters, Heartbeat (4h), and /status Active.")
 
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    await store.close()
-    await exchange.close()
-    logger.info("SignalBotAI shutdown complete.")
-
-
-# -----------------------------
-# API Endpoints
-# -----------------------------
-@app.get("/")
-async def root():
-    return {"status": "alive", "model_version": cfg.model_version}
-
-
-@app.get("/signals")
-async def get_signals(limit: int = 50):
-    rows = await store.fetch_recent(limit=limit)
-    return {"count": len(rows), "signals": rows}
-
-
-# -----------------------------
-# Run Uvicorn
-# -----------------------------
 if __name__ == "__main__":
-    uvicorn.run(
-        "signalbot:app",  # Make sure this matches your filename if it's different
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", 8000)),
-        log_level="info",
-        reload=True
-    )
+    uvicorn.run(app, host="0.0.0.0", port=8000)
