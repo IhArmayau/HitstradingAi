@@ -1,15 +1,36 @@
-asyncio
-ccxt
-pandas
-numpy
-ta
-aiosqlite
-aiohttp
-joblib
-python-dotenv
-fastapi
-uvicorn[standard]
-scikit-learn
-tensorflow
-jinja2
-python-multipart
+# Core Web & DB
+Flask==3.0.2
+Flask-Bcrypt==1.0.1
+Flask-Compress==1.23
+flask-cors==6.0.2
+Flask-Login==0.6.3
+Flask-Migrate==4.0.5
+Flask-SQLAlchemy==3.1.1
+Flask-WTF==1.2.1
+SQLAlchemy==2.0.25
+aiosqlite==0.20.0
+psycopg2-binary==2.9.11
+
+# Trading & AI Engine (Added)
+ccxt==4.2.48
+ta==0.11.0
+pandas==2.2.1
+numpy==2.2.5
+scikit-learn==1.4.1.post1
+joblib==1.3.2
+vaderSentiment==3.3.2
+aiohttp==3.9.3
+
+# Utils & API
+python-dotenv==1.2.1
+requests==2.32.5
+fastapi==0.110.0
+uvicorn==0.27.1
+jinja2==3.1.3
+cloudinary==1.44.1
+stripe==14.1.0
+
+# System
+gunicorn==21.2.0
+werkzeug==3.0.1
+sanpy==2.2.0
