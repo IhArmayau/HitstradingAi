@@ -117,7 +117,7 @@ class SignalStore:
                 if stype == "BUY":
                     if last_price >= tp: new_status = 'take_profit'
                     elif last_price <= sl: new_status = 'stop_loss'
-                else:
+                else: # SELL
                     if last_price <= tp: new_status = 'take_profit'
                     elif last_price >= sl: new_status = 'stop_loss'
                 
@@ -200,11 +200,20 @@ class SignalGenerator:
                 if df.empty or await self.store.has_open_signal(symbol): return
 
                 last = df.iloc[-1]
+                # Volatility Check
                 if last['adx'] < self.cfg.indicators.adx_threshold: return
 
-                stype = "BUY" if last['ema_short'] > last['ema_medium'] else "SELL" if last['ema_short'] < last['ema_medium'] else None
+                # Signal Determination
+                if last['ema_short'] > last['ema_medium']:
+                    stype = "BUY"
+                elif last['ema_short'] < last['ema_medium']:
+                    stype = "SELL"
+                else:
+                    return
+
+                # Trend Filter (Buy only in Bull, Sell only in Bear)
                 if stype == "BUY" and not btc_bullish: return
-                if not stype: return
+                if stype == "SELL" and btc_bullish: return
 
                 entry, atr = float(last['close']), float(last['atr'] or 0)
                 sl = entry - atr * self.cfg.indicators.atr_sl_mult if stype == "BUY" else entry + atr * self.cfg.indicators.atr_sl_mult
@@ -232,12 +241,12 @@ class SignalGenerator:
 # -----------------------------
 async def send_heartbeat(generator: SignalGenerator, cfg: BotConfig):
     btc_bullish = await generator.get_btc_health()
-    market_filter = "BULLISH (Active)" if btc_bullish else "BEARISH (Paused)"
+    market_filter = "🟢 BULLISH (Longs Only)" if btc_bullish else "🔴 BEARISH (Shorts Only)"
     
     df = await generator.fetch_candles(cfg.symbols[0], cfg.timeframe)
     df_ind = add_indicators(df, cfg.indicators)
     adx = df_ind['adx'].iloc[-1] if not df_ind.empty else 0
-    vol_status = "Trending" if adx >= cfg.indicators.adx_threshold else "Choppy"
+    vol_status = "⚡ Trending" if adx >= cfg.indicators.adx_threshold else "💤 Choppy"
 
     msg = (
         f"🤖 Bot Status Report\n"
@@ -273,10 +282,9 @@ async def telegram_polling_loop(generator: SignalGenerator, cfg: BotConfig):
                         for update in data.get("result", []):
                             offset = update["update_id"] + 1
                             message = update.get("message", {})
-                            text = message.get("text", "").lower().strip() # Case insensitive
+                            text = message.get("text", "").lower().strip()
                             chat_id = str(message.get("chat", {}).get("id", ""))
                             
-                            # Triggers if the message contains "status" (Handles /status, /Status, Send status)
                             if chat_id == cfg.telegram_chat_id and "status" in text:
                                 logger.info("Status command received!")
                                 await send_heartbeat(generator, cfg)
@@ -318,8 +326,25 @@ async def notify_signal_update(sig):
 async def send_tg(token, cid, msg):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     async with aiohttp.ClientSession() as session:
-        # Simplified: Removing parse_mode to avoid formatting errors
         await session.post(url, json={"chat_id": cid, "text": msg})
+
+async def train_models_task(generator: SignalGenerator, cfg: BotConfig):
+    """Periodically retrains ML models with new closed signals."""
+    while True:
+        await asyncio.sleep(86400) # Every 24 hours
+        logger.info("Starting scheduled ML retraining...")
+        for symbol in cfg.symbols:
+            X, y = await generator.store.get_training_data(symbol)
+            if len(y) >= cfg.min_train_samples:
+                try:
+                    scaler = StandardScaler()
+                    X_scaled = scaler.fit_transform(X)
+                    model = RandomForestClassifier(n_estimators=100, random_state=42)
+                    model.fit(X_scaled, y)
+                    generator.ml_mgr.save_model(symbol, model, scaler)
+                    logger.info(f"Retrained model for {symbol}.")
+                except Exception as e:
+                    logger.error(f"Training failed for {symbol}: {e}")
 
 # -----------------------------
 # Lifecycle
@@ -338,8 +363,7 @@ async def root():
 async def background_monitor():
     while True:
         try:
-            df_btc = await generator.fetch_candles("BTC/USDT:USDT", cfg.higher_timeframe)
-            btc_bullish = float(df_btc['close'].iloc[-1]) > float(df_btc['close'].ewm(span=200).mean().iloc[-1]) if not df_btc.empty else True
+            btc_bullish = await generator.get_btc_health()
             await asyncio.gather(*(generator.generate_signal(s, btc_bullish) for s in cfg.symbols), return_exceptions=True)
             for s in cfg.symbols:
                 df = await generator.fetch_candles(s, cfg.timeframe)
@@ -355,7 +379,8 @@ async def startup():
     asyncio.create_task(background_monitor())
     asyncio.create_task(heartbeat_loop(generator, cfg))
     asyncio.create_task(telegram_polling_loop(generator, cfg))
-    logger.info("SignalBotAI Online.")
+    asyncio.create_task(train_models_task(generator, cfg))
+    logger.info("SignalBotAI Online: Long/Short Logic Active.")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
