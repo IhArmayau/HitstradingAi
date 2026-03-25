@@ -101,6 +101,7 @@ class IndicatorsConfig:
     ema_short: int = int(os.getenv("EMA_SHORT", 9))
     ema_medium: int = int(os.getenv("EMA_MEDIUM", 21))
     adx_threshold: int = int(os.getenv("ADX_THRESHOLD", 25))
+    atr_period: int = 14
     atr_tp_mult: float = float(os.getenv("ATR_TP_MULT", 3.0))
     atr_sl_mult: float = float(os.getenv("ATR_SL_MULT", 1.5))
 
@@ -180,8 +181,10 @@ class SignalStore:
             return {row[0]: row[1] or row[0][:6] for row in res.all()}
 
     def get_symbol_lock(self, s):
-        if s not in self.symbol_locks: self.symbol_locks[s] = asyncio.Lock()
-        return self.symbol_locks[s]
+        # FIX: Convert 's' to string to avoid "unhashable type: dict" error
+        lock_key = str(s)
+        if lock_key not in self.symbol_locks: self.symbol_locks[lock_key] = asyncio.Lock()
+        return self.symbol_locks[lock_key]
 
 # -----------------------------
 # Intelligence Engines
@@ -254,37 +257,89 @@ class SignalGenerator:
         self.dex, self.security = DexEngine(session), SecurityEngine(session)
         self.hunter = DiscoveryHunter(HELIUS_API_KEY, session, cfg)
 
+    async def check_htf_trend(self, symbol: str) -> str:
+        """Confirms 1H trend: BUY if price > 200 EMA, SELL if price < 200 EMA."""
+        try:
+            ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=self.cfg.higher_timeframe, limit=201)
+            df = pd.DataFrame(ohlcv, columns=["ts", "o", "h", "l", "c", "v"])
+            ema_200 = df['c'].ewm(span=200).mean().iloc[-1]
+            last_price = df['c'].iloc[-1]
+            return "BUY" if last_price > ema_200 else "SELL"
+        except: return "NEUTRAL"
+
     async def generate_cex_signal(self, symbol: str, btc_bullish: bool):
         if not self.cfg.enable_cex or not self.cfg.trade.enabled: return
         async with self.store.get_symbol_lock(symbol):
             try:
-                ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=self.cfg.timeframe, limit=50)
+                # 1. Fetch data & Indicators
+                ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=self.cfg.timeframe, limit=100)
                 df = pd.DataFrame(ohlcv, columns=["ts", "o", "h", "l", "c", "v"])
+                
+                # EMAs
                 df['ema_s'] = df['c'].ewm(span=self.cfg.indicators.ema_short).mean()
                 df['ema_m'] = df['c'].ewm(span=self.cfg.indicators.ema_medium).mean()
+                
+                # ADX (Trend Strength)
+                adx_obj = ta.trend.ADXIndicator(df['h'], df['l'], df['c'], window=14)
+                df['adx'] = adx_obj.adx()
+                
+                # ATR (Volatility for Anti-Stop Hunt)
+                atr_obj = ta.volatility.AverageTrueRange(df['h'], df['l'], df['c'], window=self.cfg.indicators.atr_period)
+                df['atr'] = atr_obj.average_true_range()
+                
                 last = df.iloc[-1]
+                adx_val = last['adx']
+                volatility = last['atr']
+                entry_price = last['c']
 
-                funding_rate = 0.0
-                open_interest = 0.0
-                try:
-                    funding_data = await self.exchange.fetch_funding_rate(symbol)
-                    funding_rate = float(funding_data.get('fundingRate', 0.0))
-                    oi_data = await self.exchange.fetch_open_interest(symbol)
-                    open_interest = float(oi_data.get('openInterestAmount') or oi_data.get('baseVolume', 0.0))
-                except Exception as e:
-                    logger.warning(f"Sentiment fetch failed for {symbol}: {e}")
-
+                # 2. EMA Crossover Signal
                 stype = "BUY" if last['ema_s'] > last['ema_m'] else "SELL" if last['ema_s'] < last['ema_m'] else None
 
+                # 3. Apply Professional Filters & Logic
                 if stype and not await self.store.has_open_signal(symbol):
+                    # Filter: ADX (Trend Strength)
+                    if adx_val < self.cfg.indicators.adx_threshold:
+                        logger.info(f"Skipping {symbol}: Weak Trend (ADX: {adx_val:.2f})")
+                        return
+
+                    # Filter: HTF Alignment
+                    htf_trend = await self.check_htf_trend(symbol)
+                    if stype != htf_trend:
+                        logger.info(f"Skipping {symbol}: HTF Mismatch (1H: {htf_trend}, 5M: {stype})")
+                        return
+
+                    # Filter: Social Sentiment
                     social = await self.sentinel.get_sentiment(symbol)
+                    if stype == "BUY" and social['score'] < self.cfg.trade.min_sentiment_score:
+                        return
+
+                    # Dynamic Anti-Stop Hunt SL/TP Calculation
+                    if stype == "BUY":
+                        sl = entry_price - (volatility * self.cfg.indicators.atr_sl_mult)
+                        tp = entry_price + (volatility * self.cfg.indicators.atr_tp_mult)
+                    else: # SELL
+                        sl = entry_price + (volatility * self.cfg.indicators.atr_sl_mult)
+                        tp = entry_price - (volatility * self.cfg.indicators.atr_tp_mult)
+
+                    # 4. Market Stats
+                    funding_rate = 0.0
+                    open_interest = 0.0
+                    try:
+                        funding_data = await self.exchange.fetch_funding_rate(symbol)
+                        funding_rate = float(funding_data.get('fundingRate', 0.0))
+                        oi_data = await self.exchange.fetch_open_interest(symbol)
+                        open_interest = float(oi_data.get('openInterestAmount') or oi_data.get('baseVolume', 0.0))
+                    except: pass
+
                     sig = {
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                         "symbol": symbol,
                         "signal": stype,
                         "market_type": "CEX",
-                        "entry": last['c'],
-                        "confidence": 75.0,
+                        "entry": entry_price,
+                        "sl": round(sl, 6),
+                        "tp": round(tp, 6),
+                        "confidence": 75.0 + (5.0 if adx_val > 40 else 0.0),
                         "sentiment_score": social['score'],
                         "funding": funding_rate,
                         "open_interest": open_interest,
@@ -435,8 +490,9 @@ async def startup():
 async def background_monitor():
     while True:
         try:
+            # Added str() conversion to avoid unhashable type errors during iteration
             for s in cfg.symbols:
-                await generator.generate_cex_signal(s, True)
+                await generator.generate_cex_signal(str(s), True)
                 await asyncio.sleep(1)
         except: pass
         await asyncio.sleep(cfg.poll_interval)
@@ -445,13 +501,17 @@ async def notify_new_signal(sig, session, cfg, is_whale=False, is_sniper=False, 
     if not cfg.telegram_bot_token: return
     prefix = f"🎯 *SNIPER ({label})*" if is_sniper else "🐋 *WHALE*" if is_whale else "🚀 *NEW*"
 
+    sl_tp_info = ""
+    if sig.get('sl') and sig.get('tp'):
+        sl_tp_info = f"\n🛡️ *Protection:*\n└ TP: `${sig['tp']}`\n└ SL: `${sig['sl']}`"
+
     extra = ""
     if sig.get('market_type') == "CEX":
         f_rate = sig.get('funding', 0) * 100
         oi = sig.get('open_interest', 0)
         extra = f"\n📊 *Market Stats:*\n└ Funding: `{f_rate:.4f}%` \n└ OI: `{oi:,.0f}`"
 
-    msg = f"{prefix} SIGNAL\nPair: `{sig['symbol']}`\nType: {sig['signal']}\nPrice: `${sig['entry']}`{extra}"
+    msg = f"{prefix} SIGNAL\nPair: `{sig['symbol']}`\nType: {sig['signal']}\nPrice: `${sig['entry']}`{sl_tp_info}{extra}"
     try:
         await session.post(f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage",
                           json={"chat_id": cfg.telegram_chat_id, "text": msg, "parse_mode": "Markdown"})
