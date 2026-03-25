@@ -55,6 +55,7 @@ class SignalModel(Base):
     safety_score = Column(Float, default=0.0)
     sentiment_score = Column(Float, default=50.0)
     funding = Column(Float, default=0.0)
+    open_interest = Column(Float, default=0.0) # Added OI field
     is_cluster = Column(Integer, default=0)
     status = Column(String, default='open')
     model_version = Column(String)
@@ -172,17 +173,18 @@ class SignalStore:
             await session.execute(delete(TrackedWallet).where(TrackedWallet.address == address))
             await session.commit()
 
-    async def get_all_tracked_wallets(self) -> List[str]:
+    async def get_all_tracked_wallets_detailed(self) -> Dict[str, str]:
+        """Returns dict of address: label mapping"""
         async with self.async_session() as session:
-            res = await session.execute(select(TrackedWallet.address))
-            return list(res.scalars().all())
+            res = await session.execute(select(TrackedWallet.address, TrackedWallet.label))
+            return {row[0]: row[1] or row[0][:6] for row in res.all()}
 
     def get_symbol_lock(self, s):
         if s not in self.symbol_locks: self.symbol_locks[s] = asyncio.Lock()
         return self.symbol_locks[s]
 
 # -----------------------------
-# Intelligence Engines (Logic Maintained)
+# Intelligence Engines
 # -----------------------------
 class DiscoveryHunter:
     def __init__(self, helius_key: str, session: aiohttp.ClientSession, cfg: BotConfig):
@@ -256,26 +258,51 @@ class SignalGenerator:
         if not self.cfg.enable_cex or not self.cfg.trade.enabled: return
         async with self.store.get_symbol_lock(symbol):
             try:
+                # 1. Fetch OHLCV for Indicators
                 ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=self.cfg.timeframe, limit=50)
                 df = pd.DataFrame(ohlcv, columns=["ts", "o", "h", "l", "c", "v"])
                 df['ema_s'] = df['c'].ewm(span=self.cfg.indicators.ema_short).mean()
                 df['ema_m'] = df['c'].ewm(span=self.cfg.indicators.ema_medium).mean()
                 last = df.iloc[-1]
+                
+                # 2. Fetch Market Sentiment (OI & Funding)
+                funding_rate = 0.0
+                open_interest = 0.0
+                try:
+                    funding_data = await self.exchange.fetch_funding_rate(symbol)
+                    funding_rate = funding_data.get('fundingRate', 0.0)
+                    
+                    oi_data = await self.exchange.fetch_open_interest(symbol)
+                    open_interest = oi_data.get('openInterestAmount', 0.0)
+                except Exception as e:
+                    logger.warning(f"Sentiment fetch failed for {symbol}: {e}")
+
                 stype = "BUY" if last['ema_s'] > last['ema_m'] else "SELL" if last['ema_s'] < last['ema_m'] else None
+                
                 if stype and not await self.store.has_open_signal(symbol):
                     social = await self.sentinel.get_sentiment(symbol)
-                    sig = {"timestamp": datetime.now(timezone.utc).isoformat(), "symbol": symbol, "signal": stype, "market_type": "CEX", "entry": last['c'], "confidence": 75.0, "sentiment_score": social['score'], "model_version": self.cfg.model_version}
+                    sig = {
+                        "timestamp": datetime.now(timezone.utc).isoformat(), 
+                        "symbol": symbol, 
+                        "signal": stype, 
+                        "market_type": "CEX", 
+                        "entry": last['c'], 
+                        "confidence": 75.0, 
+                        "sentiment_score": social['score'],
+                        "funding": funding_rate,
+                        "open_interest": open_interest,
+                        "model_version": self.cfg.model_version
+                    }
                     await self.store.insert_signal(sig)
                     await notify_new_signal(sig, self.session, self.cfg)
-            except: pass
+            except Exception as e:
+                logger.error(f"CEX Signal Gen Error for {symbol}: {e}")
 
 # -----------------------------
-# FastAPI App (PRODUCTION FIX)
+# FastAPI App
 # -----------------------------
 BASE_DIR = Path(__file__).resolve().parent
 app = FastAPI()
-
-# FIXED: Ensure absolute path for templates
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 cfg = BotConfig()
@@ -287,10 +314,8 @@ generator: Optional[SignalGenerator] = None
 
 @app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 async def index(request: Request):
-    """FIXED: Robust index route to ensure signals display"""
     try:
         signals = await store.get_latest_signals(limit=25)
-        # Verify template exists before rendering
         return templates.TemplateResponse("index.html", {
             "request": request, 
             "signals": signals,
@@ -305,24 +330,41 @@ async def index(request: Request):
 async def helius_webhook_handler(request: Request):
     try:
         data = await request.json()
-        db_wallets = await store.get_all_tracked_wallets()
-        master_tracked = list(set(cfg.tracked_wallets + db_wallets))
+        db_wallet_map = await store.get_all_tracked_wallets_detailed()
+        master_tracked = list(set(cfg.tracked_wallets + list(db_wallet_map.keys())))
+        
         for event in data:
             if event.get("type") != "SWAP": continue
             swap_info = event.get("events", {}).get("swap", {})
             token_address = swap_info.get("tokenOutMint")
             buyer_wallet = event.get("feePayer")
             if not token_address: continue
+            
             is_whale = await generator.hunter.is_whale_funded(buyer_wallet)
             is_sniper = buyer_wallet in master_tracked
+            sniper_label = db_wallet_map.get(buyer_wallet, "Tracked Wallet")
+            
             cluster_count = cluster_map.record_and_check(token_address)
             dex_data = await generator.dex.get_price_data(token_address)
             security = await generator.security.get_safety_report(token_address, dex_data['vol24'], dex_data['liq'])
+            
             if (is_sniper or is_whale or cluster_count >= 2) and security['safety_score'] >= cfg.trade.min_safety_score:
                 if not await store.has_open_signal(token_address):
-                    sig = {"timestamp": datetime.now(timezone.utc).isoformat(), "symbol": dex_data['symbol'], "market_type": "DEX", "contract_address": token_address, "signal": "BUY", "entry": dex_data['price'], "confidence": 100.0 if is_sniper else 90.0, "safety_score": security['safety_score'], "vol_liq_ratio": security['vl_ratio'], "is_cluster": 1 if cluster_count >= 2 else 0, "model_version": cfg.model_version}
+                    sig = {
+                        "timestamp": datetime.now(timezone.utc).isoformat(), 
+                        "symbol": dex_data['symbol'], 
+                        "market_type": "DEX", 
+                        "contract_address": token_address, 
+                        "signal": "BUY", 
+                        "entry": dex_data['price'], 
+                        "confidence": 100.0 if is_sniper else 90.0, 
+                        "safety_score": security['safety_score'], 
+                        "vol_liq_ratio": security['vl_ratio'], 
+                        "is_cluster": 1 if cluster_count >= 2 else 0, 
+                        "model_version": cfg.model_version
+                    }
                     await store.insert_signal(sig)
-                    await notify_new_signal(sig, session, cfg, is_whale=is_whale, is_sniper=is_sniper)
+                    await notify_new_signal(sig, session, cfg, is_whale=is_whale, is_sniper=is_sniper, label=sniper_label)
         return {"status": "success"}
     except: return {"status": "error"}
 
@@ -344,8 +386,9 @@ async def telegram_command_handler(request: Request):
             for s in signals: pnl_msg += f"• {s.symbol}: Entry ${s.entry} ({s.status})\n"
             await send_direct_tg(pnl_msg if signals else "No trade history found.")
         elif text == "/list":
-            wallets = await store.get_all_tracked_wallets()
-            msg = f"🔍 **CEX Pairs:**\n`{', '.join(cfg.symbols)}`\n\n🎯 **DEX Snipers:**\n`{len(wallets)} wallets active`"
+            wallets = await store.get_all_tracked_wallets_detailed()
+            msg = f"🔍 **CEX Pairs:**\n`{', '.join(cfg.symbols)}`\n\n🎯 **DEX Snipers:**\n"
+            for addr, lbl in wallets.items(): msg += f"• {lbl}: `{addr[:8]}...`\n"
             await send_direct_tg(msg)
         elif text.startswith("/pair "):
             parts = text.split(" ")
@@ -372,7 +415,7 @@ async def telegram_command_handler(request: Request):
             await store.save_setting("auto_trade", "true")
             await send_direct_tg("🟢 **Auto-Trading Resumed.**")
         elif text == "/help":
-            help_txt = ("📖 **QuikPulse Commands**\n• `/pair add [Symbol/Wallet]`\n• `/set [Key] [Value]`\n• `/status`\n• `/pnl`")
+            help_txt = ("📖 **QuikPulse Commands**\n• `/pair add [Symbol/Wallet]`\n• `/set [Key] [Value]`\n• `/status`\n• `/pnl`\n• `/list`")
             await send_direct_tg(help_txt)
         return {"ok": True}
     except: return {"ok": True}
@@ -396,11 +439,19 @@ async def background_monitor():
         except: pass
         await asyncio.sleep(cfg.poll_interval)
 
-async def notify_new_signal(sig, session, cfg, is_whale=False, is_sniper=False):
+async def notify_new_signal(sig, session, cfg, is_whale=False, is_sniper=False, label=None):
     if not cfg.telegram_bot_token: return
-    prefix = "🎯 *SNIPER*" if is_sniper else "🐋 *WHALE*" if is_whale else "🚀 *NEW*"
-    msg = f"{prefix} SIGNAL\nPair: `{sig['symbol']}`\nType: {sig['signal']}\nPrice: `${sig['entry']}`"
-    try: await session.post(f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage", json={"chat_id": cfg.telegram_chat_id, "text": msg, "parse_mode": "Markdown"})
+    prefix = f"🎯 *SNIPER ({label})*" if is_sniper else "🐋 *WHALE*" if is_whale else "🚀 *NEW*"
+    
+    # Enrich msg with Funding/OI for CEX
+    extra = ""
+    if sig.get('market_type') == "CEX":
+        extra = f"\nFunding: `{sig.get('funding', 0)*100:.4f}%` \nOI: `{sig.get('open_interest', 0):,.0f}`"
+    
+    msg = f"{prefix} SIGNAL\nPair: `{sig['symbol']}`\nType: {sig['signal']}\nPrice: `${sig['entry']}`{extra}"
+    try: 
+        await session.post(f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage", 
+                          json={"chat_id": cfg.telegram_chat_id, "text": msg, "parse_mode": "Markdown"})
     except: pass
 
 async def send_direct_tg(text: str):
