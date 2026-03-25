@@ -129,7 +129,14 @@ class BotConfig:
 # -----------------------------
 class SignalStore:
     def __init__(self, db_url: str):
-        self.engine = create_async_engine(db_url, pool_pre_ping=True)
+        # Update: Limit connections to prevent Aiven SUPERUSER exhaustion
+        self.engine = create_async_engine(
+            db_url, 
+            pool_size=2,          # Max 2 persistent connections
+            max_overflow=0,       # No extra overflow connections
+            pool_pre_ping=True,   # Check connection health before use
+            pool_recycle=1800     # Refresh connections every 30 mins
+        )
         self.async_session = sessionmaker(self.engine, expire_on_commit=False, class_=AsyncSession)
         self.symbol_locks = {}
 
@@ -490,7 +497,6 @@ async def startup():
 async def background_monitor():
     while True:
         try:
-            # Added str() conversion to avoid unhashable type errors during iteration
             for s in cfg.symbols:
                 await generator.generate_cex_signal(str(s), True)
                 await asyncio.sleep(1)
