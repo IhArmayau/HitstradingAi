@@ -21,7 +21,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 import uvicorn
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
-import san 
+import san
 
 # -----------------------------
 # Load environment
@@ -63,8 +63,8 @@ class IndicatorsConfig:
     atr_period: int = int(os.getenv("ATR_PERIOD", 14))
     bb_period: int = int(os.getenv("BB_PERIOD", 20))
     bb_std: float = float(os.getenv("BB_STD", 2.0))
-    atr_tp_mult: float = float(os.getenv("ATR_TP_MULT", 3.0)) # 3x ATR for TP
-    atr_sl_mult: float = float(os.getenv("ATR_SL_MULT", 1.5)) # 1.5x ATR for SL
+    atr_tp_mult: float = float(os.getenv("ATR_TP_MULT", 3.0)) 
+    atr_sl_mult: float = float(os.getenv("ATR_SL_MULT", 1.5)) 
     max_spread_pct: float = float(os.getenv("MAX_SPREAD_PCT", 0.15))
 
 @dataclass
@@ -84,6 +84,7 @@ class BotConfig:
     insider_poll_interval: int = 120
     cluster_window_minutes: int = 30
     min_insider_usd: float = float(os.getenv("MIN_INSIDER_USD", 5000.0))
+    min_insider_buy_sol: float = float(os.getenv("MIN_INSIDER_BUY_SOL", 2.0))
     vl_ratio_max: float = 10.0
     min_liquidity_usd: float = 15000.0
     sqlite_db: str = os.getenv("SQLITE_DB", "signals.db")
@@ -103,7 +104,6 @@ class BotConfig:
 # -----------------------------
 
 class SocialSentinel:
-    """Enhanced Santiment Integration for Perpetuals"""
     def __init__(self, api_key: str, session: aiohttp.ClientSession):
         self.api_key, self.session = api_key, session
         if self.api_key: san.ApiConfig.api_key = self.api_key
@@ -119,12 +119,12 @@ class SocialSentinel:
         try:
             data = await asyncio.to_thread(san.get, "sentiment_balance_per_asset", slug=slug, from_date="now-1d", to_date="now", interval="1h")
             funding = await asyncio.to_thread(san.get, "funding_rates_aggregated_by_exchange", slug=slug, from_date="now-8h", to_date="now")
-            
+
             score = 50
             if not data.empty:
                 val = data.iloc[-1][0]
                 score = max(0, min(100, int(((val + 5) / 10) * 100)))
-            
+
             f_rate = round(funding.iloc[-1][0], 5) if not funding.empty else 0.0
             label = "Bullish" if score > 60 else "Bearish" if score < 40 else "Neutral"
             return {"score": score, "label": label, "funding": f_rate}
@@ -311,19 +311,19 @@ class SignalGenerator:
                     if df.empty or await self.store.has_open_signal(symbol): return
                     last = df.iloc[-1]
                     if last['adx'] < self.cfg.indicators.adx_threshold: return
-                    
+
                     stype = "BUY" if last['ema_short'] > last['ema_medium'] else "SELL" if last['ema_short'] < last['ema_medium'] else None
                     if not stype or (stype == "BUY" and not btc_bullish) or (stype == "SELL" and btc_bullish): return
-                    
+
                     price, atr = float(last['close']), float(last['atr'])
                     sl_dist, tp_dist = atr * self.cfg.indicators.atr_sl_mult, atr * self.cfg.indicators.atr_tp_mult
-                    
+
                     sl = price - sl_dist if stype == "BUY" else price + sl_dist
                     tp = price + tp_dist if stype == "BUY" else price - tp_dist
-                    
+
                     social = await self.sentinel.get_sentiment(symbol)
                     ml_conf = await self.get_ml_confidence(symbol, [price, 0, social['score'], 70.0])
-                    
+
                     sig = {
                         "timestamp": datetime.now(timezone.utc).isoformat(), "symbol": symbol, "signal": stype, "market_type": "CEX",
                         "entry": price, "sl": round(sl, 6), "tp": round(tp, 6), "confidence": ml_conf,
@@ -359,40 +359,8 @@ class SignalGenerator:
             await asyncio.sleep(self.cfg.dex_poll_interval)
 
     async def fetch_insider_signals(self):
+        # Note: Handled by Webhooks in real-time version.
         while True:
-            if self.cfg.enable_whale and self.cfg.tracked_wallets:
-                blacklist = await self.store.get_blacklist()
-                for wallet in self.cfg.tracked_wallets:
-                    if wallet in blacklist: continue
-                    try:
-                        sigs = await self.helius.get_wallet_activity(wallet)
-                        for s in sigs:
-                            if (datetime.now(timezone.utc).timestamp() - s['blockTime']) > 120: continue
-                            tx_url = f"https://api.helius-rpc.com/v0/transactions/?api-key={self.helius.api_key}"
-                            async with self.session.post(tx_url, json={"transactions": [s['signature']]}) as tx_resp:
-                                tx_data = await tx_resp.json()
-                                if not tx_data: continue
-                                events = tx_data[0].get('events', {}).get('swap', [])
-                                if not events: continue
-                                token_addr = events[0].get('tokenOutMint')
-                                if await self.store.has_open_signal(token_addr): continue
-                                price_data = await self.dex.get_price_data(token_addr)
-                                if price_data['price'] == 0: continue
-                                hit_count = self.cluster.record_and_check(token_addr)
-                                is_cluster = 1 if hit_count >= 2 else 0
-                                social = await self.sentinel.get_sentiment(price_data['symbol'])
-                                source = await self.helius.get_funding_source(wallet)
-                                report = await self.security.get_safety_report(token_addr, price_data['vol24'], price_data['liq'], self.helius)
-                                ml_conf = await self.get_ml_confidence("GLOBAL", [price_data['price'], report['safety_score'], social['score'], 90.0])
-                                sig = {
-                                    "timestamp": datetime.now(timezone.utc).isoformat(), "symbol": price_data['symbol'], "market_type": "INSIDER (HELIUS)",
-                                    "contract_address": token_addr, "signal": f"BUY ({'CLUSTER' if is_cluster else f'WHALE - {source}'})",
-                                    "entry": price_data['price'], "confidence": ml_conf,
-                                    "safety_score": report['safety_score'], "sentiment_score": social['score'], "is_cluster": is_cluster
-                                }
-                                await self.store.insert_signal(sig)
-                                await notify_new_signal(sig, self.session, self.cfg)
-                    except: pass
             await asyncio.sleep(self.cfg.insider_poll_interval)
 
 # -----------------------------
@@ -457,10 +425,10 @@ async def notify_new_signal(sig, session, cfg_bot):
     if not cfg_bot.telegram_bot_token: return
     prefix = "🚨 *CLUSTER BUY DETECTED!* 🚨\n" if sig.get('is_cluster') else "🚀 *NEW SIGNAL*\n"
     ca_link = f"https://dexscreener.com/solana/{sig.get('contract_address')}" if sig.get('contract_address') else "#"
-    
+
     funding = sig.get('funding', 0.0)
     f_emoji = "⚠️" if abs(funding) > 0.01 else "✅"
-    
+
     msg = (
         f"{prefix}Pair: `{sig['symbol']}`\nType: {sig['signal']}\n"
         f"Price: `${sig['entry']}`\n"
@@ -488,6 +456,53 @@ async def root(request: Request):
     for s in signals: html += f"<tr><td>{s['id']}</td><td>{s['symbol']}</td><td>{s['signal']}</td><td>{s['entry']}</td><td>{s.get('sl','-')}</td><td>{s.get('tp','-')}</td><td>{s['sentiment_score']}</td><td>{s['confidence']}%</td></tr>"
     return html + "</table>"
 
+@app.post("/webhook/helius")
+async def helius_webhook_handler(request: Request):
+    data = await request.json()
+    logger.info(f"Helius Webhook Received: {len(data)} events")
+
+    for activity in data:
+        events = activity.get('events', {})
+        swap = events.get('swap', {})
+        
+        if swap:
+            raw_amount = float(swap.get('nativeInput', {}).get('amount', 0))
+            amount_sol = raw_amount / 1_000_000_000 
+            
+            if amount_sol < cfg.min_insider_buy_sol:
+                continue 
+
+            token_addr = swap.get('tokenOutMint')
+            if await store.has_open_signal(token_addr):
+                continue
+
+            price_data = await generator.dex.get_price_data(token_addr)
+            if price_data['price'] > 0:
+                social = await generator.sentinel.get_sentiment(price_data['symbol'])
+                report = await generator.security.get_safety_report(token_addr, price_data['vol24'], price_data['liq'], generator.helius)
+                
+                hit_count = generator.cluster.record_and_check(token_addr)
+                is_cluster = 1 if hit_count >= 2 else 0
+
+                sig = {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "symbol": price_data['symbol'],
+                    "market_type": "INSIDER (WEBHOOK)",
+                    "contract_address": token_addr,
+                    "signal": f"BUY ({'CLUSTER' if is_cluster else 'WHALE MOVE'})",
+                    "entry": price_data['price'],
+                    "confidence": 95.0 if is_cluster else 85.0,
+                    "safety_score": report['safety_score'],
+                    "sentiment_score": social['score'],
+                    "is_cluster": is_cluster
+                }
+
+                await store.insert_signal(sig)
+                await notify_new_signal(sig, session, cfg)
+                logger.info(f"🚀 Webhook Signal Fired: {price_data['symbol']} ({amount_sol} SOL)")
+
+    return {"status": "success"}
+
 @app.on_event("startup")
 async def startup():
     global session, generator
@@ -496,14 +511,17 @@ async def startup():
     sentinel = SocialSentinel(SANTIMENT_API_KEY, session)
     generator = SignalGenerator(cfg, store, exchange, sentinel, cluster_map, session)
     trainer = ModelTrainer(cfg.sqlite_db, cfg.ml_model_path)
-    if WEBHOOK_URL and cfg.tracked_wallets: await generator.helius.setup_webhooks(WEBHOOK_URL, cfg.tracked_wallets)
+    
+    if WEBHOOK_URL and cfg.tracked_wallets: 
+        await generator.helius.setup_webhooks(WEBHOOK_URL, cfg.tracked_wallets)
+        
     asyncio.create_task(background_monitor())
     asyncio.create_task(generator.fetch_dex_alpha())
-    asyncio.create_task(generator.fetch_insider_signals())
+    # Polling disabled in favor of Helius Webhooks
+    # asyncio.create_task(generator.fetch_insider_signals())
     asyncio.create_task(telegram_command_listener(session, cfg))
     asyncio.create_task(continuous_learning_loop(trainer))
-    logger.info("QuikPulse: Production Ready with Santiment & Volatility Logic.")
+    logger.info("QuikPulse: Production Ready with Helius Webhook & Whale Filter.")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
-# Version 2026.03.25-FullProduction
