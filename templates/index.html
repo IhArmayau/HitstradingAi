@@ -29,7 +29,7 @@
                 </div>
                 <span class="text-xl font-black tracking-tighter uppercase text-white">Quik<span class="text-blue-500 italic">Pulse</span></span>
             </div>
-            
+
             <div class="hidden lg:flex items-center gap-8 text-[11px] font-bold uppercase tracking-widest text-slate-400">
                 <a href="#live-feed" class="hover:text-blue-400 transition flex items-center gap-2"><span class="w-1.5 h-1.5 bg-blue-500 rounded-full"></span> Live Signals</a>
                 <a href="/admin/wallets" class="hover:text-blue-400 transition">Neural Admin</a>
@@ -40,7 +40,10 @@
             <div class="flex items-center gap-4">
                 <div class="hidden sm:flex flex-col items-end">
                     <span class="text-[9px] font-bold text-green-500 flex items-center gap-1.5">
-                        <span class="relative flex h-2 w-2"><span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span><span class="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span></span>
+                        <span class="relative flex h-2 w-2">
+                            <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+                            <span class="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
+                        </span>
                         SYSTEM NOMINAL
                     </span>
                     <span class="text-[10px] text-slate-500 font-mono">v5.2.0-stable</span>
@@ -64,7 +67,7 @@
             <p class="text-slate-400 text-lg max-w-2xl mx-auto leading-relaxed mb-10">
                 The first autonomous signal engine combining <span class="text-white font-semibold">RandomForest Classifiers</span> with real-time <span class="text-white font-semibold">Insider Cluster Mapping</span>.
             </p>
-            
+
             <div class="grid grid-cols-2 md:grid-cols-4 gap-4 max-w-4xl mx-auto">
                 <div class="glass p-4 rounded-2xl">
                     <div class="text-slate-500 text-[10px] uppercase font-bold mb-1">24h Win Rate</div>
@@ -90,7 +93,7 @@
                 <div class="p-8 border-b border-white/5 flex flex-col md:flex-row justify-between items-center gap-4 bg-white/[0.02]">
                     <div>
                         <h2 class="text-xl font-bold text-white flex items-center gap-3">
-                            Neural Intelligence Stream 
+                            Neural Intelligence Stream
                             <span class="text-[10px] bg-blue-500 text-white px-2 py-0.5 rounded uppercase tracking-tighter">Live</span>
                         </h2>
                         <p class="text-xs text-slate-500 mt-1 uppercase tracking-widest font-medium">Scanned via CEX, DEX, and On-Chain Webhooks</p>
@@ -98,7 +101,13 @@
                     <div class="flex items-center gap-3">
                         <div class="text-right">
                             <div class="text-[10px] text-slate-500 uppercase font-bold">Inference Engine</div>
-                            <div class="text-xs font-mono text-blue-400">{{ signals[0].model_version if signals else 'v5.2.0-RF' }}</div>
+                            <div class="text-xs font-mono text-blue-400">
+                                {% if signals and signals|length > 0 %}
+                                    {{ signals[0].model_version }}
+                                {% else %}
+                                    v5.2.0-RF
+                                {% endif %}
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -191,7 +200,7 @@
                 <h2 class="text-4xl font-bold text-white mb-4">Autonomous <span class="gradient-text">Learning Pipeline</span></h2>
                 <p class="text-slate-500 max-w-xl mx-auto uppercase text-[10px] tracking-[0.2em] font-bold">The math behind the money</p>
             </div>
-            
+
             <div class="grid md:grid-cols-3 gap-8">
                 <div class="glass p-10 rounded-[2.5rem] hover:border-blue-500/40 transition-all group">
                     <div class="w-14 h-14 bg-blue-600/10 rounded-2xl flex items-center justify-center mb-8 border border-blue-500/20 group-hover:scale-110 transition-transform">

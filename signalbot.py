@@ -55,7 +55,7 @@ class TradeConfig:
     min_sentiment_score: float = 60.0
     max_funding_threshold: float = 0.05
     min_win_rate_threshold: float = 0.40
-    signal_cooldown_minutes: int = 60 
+    signal_cooldown_minutes: int = 60
 
 @dataclass
 class IndicatorsConfig:
@@ -167,8 +167,8 @@ class ModelTrainer:
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 query = """
-                    SELECT entry, safety_score, sentiment_score, confidence, vol_liq_ratio, funding, status 
-                    FROM signals 
+                    SELECT entry, safety_score, sentiment_score, confidence, vol_liq_ratio, funding, status
+                    FROM signals
                     WHERE status IN ('win', 'loss')
                 """
                 if symbol != "GLOBAL": query += f" AND symbol = '{symbol}'"
@@ -264,7 +264,7 @@ class SignalStore:
     def get_symbol_lock(self, s):
         if s not in self.symbol_locks: self.symbol_locks[s] = asyncio.Lock()
         return self.symbol_locks[s]
-    
+
     async def get_pnl_stats(self, timeframe_hours: int = None):
         query = "SELECT status, COUNT(*), SUM(CASE WHEN status='win' THEN 1 ELSE 0 END) FROM signals WHERE status IN ('win', 'loss')"
         params = []
@@ -272,7 +272,7 @@ class SignalStore:
             since = (datetime.now(timezone.utc) - timedelta(hours=timeframe_hours)).isoformat()
             query += " AND timestamp > ?"
             params.append(since)
-        
+
         async with self.conn.execute(query, params) as cursor:
             row = await cursor.fetchone()
             if not row or row[1] == 0: return None
@@ -306,7 +306,7 @@ class SignalGenerator:
     async def generate_cex_signal(self, symbol: str, btc_bullish: bool):
         if not self.cfg.enable_cex or not self.cfg.trade.enabled: return
         now = datetime.now(timezone.utc)
-        
+
         if symbol in self.last_signal_time and now - self.last_signal_time[symbol] < timedelta(minutes=self.cfg.trade.signal_cooldown_minutes):
             return
 
@@ -322,17 +322,17 @@ class SignalGenerator:
                     if last['adx'] < self.cfg.indicators.adx_threshold: return
                     stype = "BUY" if last['ema_short'] > last['ema_medium'] else "SELL" if last['ema_short'] < last['ema_medium'] else None
                     if not stype or (stype == "BUY" and not btc_bullish) or (stype == "SELL" and btc_bullish): return
-                    
+
                     social = await self.sentinel.get_sentiment(symbol)
                     funding = social.get('funding', 0.0)
                     if abs(funding) > self.cfg.trade.max_funding_threshold: return
-                    
+
                     price, atr = float(last['close']), float(last['atr'])
                     sl_dist, tp_dist = atr * self.cfg.indicators.atr_sl_mult, atr * self.cfg.indicators.atr_tp_mult
                     sl = price - sl_dist if stype == "BUY" else price + sl_dist
                     tp = price + tp_dist if stype == "BUY" else price - tp_dist
                     ml_conf = await self.get_ml_confidence(symbol, [price, 0, social['score'], 70.0, 0.0, funding])
-                    
+
                     sig = {
                         "timestamp": now.isoformat(), "symbol": symbol, "signal": stype, "market_type": "CEX",
                         "entry": price, "sl": round(sl, 6), "tp": round(tp, 6), "confidence": ml_conf,
@@ -395,7 +395,7 @@ class PositionMonitor:
                     elif "DEX" in mtype or "INSIDER" in mtype:
                         p_data = await self.dex.get_price_data(addr)
                         current_price = p_data['price']
-                    
+
                     if current_price == 0: continue
                     is_win, is_loss = False, False
                     if "BUY" in side:
@@ -409,9 +409,9 @@ class PositionMonitor:
                         status = "win" if is_win else "loss"
                         duration = int((datetime.now(timezone.utc) - datetime.fromisoformat(ts)).total_seconds() / 60)
                         pnl_pct = ((current_price - entry) / entry * 100) if "BUY" in side else ((entry - current_price) / entry * 100)
-                        
+
                         await self.store.update_signal_status(sig_id, status, duration)
-                        
+
                         emoji = "✅" if is_win else "❌"
                         msg = (f"{emoji} *Signal Closed: {status.upper()}*\n"
                                f"Pair: `{symbol}`\n"
@@ -421,7 +421,7 @@ class PositionMonitor:
                                f"PnL: `{pnl_pct:+.2f}%`\n"
                                f"Duration: `{duration} mins`")
                         await send_tg_msg(self.session, self.cfg, msg)
-                        
+
             except Exception as e: logger.error(f"Monitor Error: {e}")
             await asyncio.sleep(30)
 
@@ -466,7 +466,7 @@ async def telegram_command_listener(session: aiohttp.ClientSession, cfg: BotConf
                 data = await resp.json()
                 for update in data.get("result", []):
                     last_id = update["update_id"]
-                    
+
                     # Handle Button Taps (Callback Queries)
                     cb_query = update.get("callback_query", {})
                     if cb_query:
@@ -483,7 +483,7 @@ async def telegram_command_listener(session: aiohttp.ClientSession, cfg: BotConf
                         elif cb_data == "toggle_trade":
                             cfg.trade.enabled = not cfg.trade.enabled
                             msg = f"Auto-Trading: {'▶️ ACTIVE' if cfg.trade.enabled else '⏸️ PAUSED'}"
-                        
+
                         await send_tg_msg(session, cfg, f"⚙️ {msg}")
                         # Acknowledge the callback to Telegram
                         await session.post(f"https://api.telegram.org/bot{cfg.telegram_bot_token}/answerCallbackQuery", json={"callback_query_id": cb_query['id']})
@@ -507,16 +507,16 @@ async def telegram_command_listener(session: aiohttp.ClientSession, cfg: BotConf
                                 ]
                             ]
                         }
-                        
+
                         status_text = (f"🚀 *QuikPulse Control Center*\n"
                                      f"Model: `{cfg.model_version}`\n"
                                      f"EMA Strategy: `{cfg.indicators.ema_short}/{cfg.indicators.ema_medium}`")
-                        
+
                         await session.post(
-                            f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage", 
+                            f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage",
                             json={
-                                "chat_id": cfg.telegram_chat_id, 
-                                "text": status_text, 
+                                "chat_id": cfg.telegram_chat_id,
+                                "text": status_text,
                                 "parse_mode": "Markdown",
                                 "reply_markup": keyboard
                             }
@@ -574,10 +574,10 @@ async def telegram_command_listener(session: aiohttp.ClientSession, cfg: BotConf
                                     await send_tg_msg(session, cfg, f"⚙️ Updated `{param}` to `{val}`")
                                 except: await send_tg_msg(session, cfg, "❌ Invalid value.")
 
-                    elif text == "/resume": 
+                    elif text == "/resume":
                         cfg.trade.enabled = True
                         await send_tg_msg(session, cfg, "▶️ Trading manually resumed.")
-                    
+
                     elif text in ["/help", "/start"]:
                         help_msg = ("💡 *QuikPulse AI Commands:*\n"
                                    "• `/status` - Control center dashboard\n"
@@ -643,8 +643,15 @@ generator: Optional[SignalGenerator] = None
 # Web Routes
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    signals = await store.get_latest_signals(limit=20)
-    return templates.TemplateResponse("index.html", {"request": request, "signals": signals})
+    try:
+        signals = await store.get_latest_signals(limit=20)
+        return templates.TemplateResponse("index.html", {
+            "request": request, 
+            "signals": signals if signals is not None else []
+        })
+    except Exception as e:
+        logger.error(f"Dashboard Route Error: {e}")
+        return HTMLResponse("Database Initializing... Please refresh in a moment.")
 
 @app.post("/webhook")
 async def helius_webhook_handler(request: Request):
@@ -673,8 +680,8 @@ async def helius_webhook_handler(request: Request):
                 sig = {
                     "timestamp": now.isoformat(), "symbol": price_data['symbol'], "market_type": "INSIDER (WEBHOOK)",
                     "contract_address": token_addr, "signal": f"BUY ({'CLUSTER' if is_cluster else 'WHALE MOVE'})",
-                    "entry": price_data['price'], "confidence": ml_conf, "safety_score": report['safety_score'], 
-                    "sentiment_score": social['score'], "funding": funding, "is_cluster": is_cluster, 
+                    "entry": price_data['price'], "confidence": ml_conf, "safety_score": report['safety_score'],
+                    "sentiment_score": social['score'], "funding": funding, "is_cluster": is_cluster,
                     "vol_liq_ratio": report['vl_ratio'], "model_version": cfg.model_version
                 }
                 await store.insert_signal(sig)
