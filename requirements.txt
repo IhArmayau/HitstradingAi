@@ -1,3 +1,5 @@
+--prefer-binary
+
 # Core Web & API (FastAPI)
 fastapi
 uvicorn
@@ -20,7 +22,6 @@ joblib
 
 # Intelligence & Social API
 sanpy
-santiment-py
 vaderSentiment
 
 # Automation & System
@@ -30,5 +31,5 @@ requests
 gunicorn
 werkzeug
 
-# Payments (If using for QuikPulse)
+# Payments
 stripe
