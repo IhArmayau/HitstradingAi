@@ -1,28 +1,34 @@
-# Core Web & DB
-Flask
+# Core Web & API (FastAPI)
+fastapi
+uvicorn
+jinja2
+python-multipart
+aiohttp
+
+# Database & Storage
 aiosqlite
 psycopg2-binary
+cloudinary
 
-# Trading & AI Engine
+# Trading & Logic Engine
 ccxt
 ta
 pandas
 numpy
 scikit-learn
 joblib
-vaderSentiment
-aiohttp
 
-# Utils & API
+# Intelligence & Social API
+sanpy
+santiment-py
+vaderSentiment
+
+# Automation & System
+apscheduler
 python-dotenv
 requests
-fastapi
-uvicorn
-jinja2
-cloudinary
-stripe
-sanpy
-
-# System
 gunicorn
 werkzeug
+
+# Payments (If using for QuikPulse)
+stripe

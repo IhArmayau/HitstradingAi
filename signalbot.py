@@ -18,10 +18,12 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Form
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 import uvicorn
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
 import san
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # -----------------------------
 # Load environment
@@ -97,7 +99,7 @@ class BotConfig:
     ml_model_path: str = os.getenv("ML_MODEL_PATH", "models")
     telegram_bot_token: Optional[str] = os.getenv("TELEGRAM_BOT_TOKEN")
     telegram_chat_id: Optional[str] = os.getenv("TELEGRAM_CHAT_ID")
-    model_version: str = os.getenv("MODEL_VERSION", "v4-prod")
+    model_version: str = os.getenv("MODEL_VERSION", "v5.2-prod")
     tracked_wallets: List[str] = field(default_factory=lambda: [
         w.strip() for w in os.getenv("TRACKED_WALLETS", "").split(',') if w.strip()
     ])
@@ -253,11 +255,29 @@ class SignalStore:
     async def update_signal_status(self, sig_id: int, status: str, duration: int = 0):
         await self.conn.execute("UPDATE signals SET status = ?, time_to_close = ? WHERE id = ?", (status, duration, sig_id))
         await self.conn.commit()
+    async def get_latest_signals(self, limit: int = 20):
+        self.conn.row_factory = aiosqlite.Row
+        async with self.conn.execute("SELECT * FROM signals ORDER BY id DESC LIMIT ?", (limit,)) as cursor:
+            return await cursor.fetchall()
     async def has_open_signal(self, iden: str):
         async with self.conn.execute("SELECT 1 FROM signals WHERE (symbol=? OR contract_address=?) AND status='open'", (iden, iden)) as c: return await c.fetchone() is not None
     def get_symbol_lock(self, s):
         if s not in self.symbol_locks: self.symbol_locks[s] = asyncio.Lock()
         return self.symbol_locks[s]
+    
+    async def get_pnl_stats(self, timeframe_hours: int = None):
+        query = "SELECT status, COUNT(*), SUM(CASE WHEN status='win' THEN 1 ELSE 0 END) FROM signals WHERE status IN ('win', 'loss')"
+        params = []
+        if timeframe_hours:
+            since = (datetime.now(timezone.utc) - timedelta(hours=timeframe_hours)).isoformat()
+            query += " AND timestamp > ?"
+            params.append(since)
+        
+        async with self.conn.execute(query, params) as cursor:
+            row = await cursor.fetchone()
+            if not row or row[1] == 0: return None
+            total, wins = row[1], row[2]
+            return {"total": total, "wins": wins, "losses": total - wins, "win_rate": round((wins/total)*100, 2)}
 
 class SignalGenerator:
     def __init__(self, cfg: BotConfig, store: SignalStore, ex: ccxt.Exchange, sentinel: SocialSentinel, cluster: ClusterEngine, session: aiohttp.ClientSession):
@@ -392,7 +412,6 @@ class PositionMonitor:
                         
                         await self.store.update_signal_status(sig_id, status, duration)
                         
-                        # Enhanced Notification
                         emoji = "✅" if is_win else "❌"
                         msg = (f"{emoji} *Signal Closed: {status.upper()}*\n"
                                f"Pair: `{symbol}`\n"
@@ -404,7 +423,7 @@ class PositionMonitor:
                         await send_tg_msg(self.session, self.cfg, msg)
                         
             except Exception as e: logger.error(f"Monitor Error: {e}")
-            await asyncio.sleep(30) # Increased check frequency for SL/TP sensitivity
+            await asyncio.sleep(30)
 
 class RiskManager:
     def __init__(self, cfg: BotConfig, store: SignalStore, session: aiohttp.ClientSession):
@@ -426,7 +445,19 @@ class RiskManager:
 # Bot Lifecycle & Telegram
 # -----------------------------
 
-async def telegram_command_listener(session: aiohttp.ClientSession, cfg: BotConfig, sentinel: SocialSentinel):
+async def send_daily_report(session: aiohttp.ClientSession, cfg: BotConfig, store: SignalStore):
+    stats = await store.get_pnl_stats(timeframe_hours=24)
+    if stats:
+        report = (f"📅 *Daily Performance Report*\n"
+                  f"Period: Last 24 Hours\n\n"
+                  f"✅ Wins: `{stats['wins']}`\n"
+                  f"❌ Losses: `{stats['losses']}`\n"
+                  f"📈 Win Rate: `{stats['win_rate']}%`\n\n"
+                  f"🤖 Bot Status: `{'ACTIVE' if cfg.trade.enabled else 'PAUSED'}`\n"
+                  f"🔥 Model: `{cfg.model_version}`")
+        await send_tg_msg(session, cfg, report)
+
+async def telegram_command_listener(session: aiohttp.ClientSession, cfg: BotConfig, sentinel: SocialSentinel, store: SignalStore):
     last_id = 0
     url = f"https://api.telegram.org/bot{cfg.telegram_bot_token}/getUpdates"
     while True:
@@ -435,29 +466,97 @@ async def telegram_command_listener(session: aiohttp.ClientSession, cfg: BotConf
                 data = await resp.json()
                 for update in data.get("result", []):
                     last_id = update["update_id"]
+                    
+                    # Handle Button Taps (Callback Queries)
+                    cb_query = update.get("callback_query", {})
+                    if cb_query:
+                        cb_data = cb_query.get("data")
+                        chat_id = str(cb_query.get("message", {}).get("chat", {}).get("id", ""))
+                        if chat_id != cfg.telegram_chat_id: continue
+
+                        if cb_data == "toggle_cex":
+                            cfg.enable_cex = not cfg.enable_cex
+                            msg = f"CEX Monitoring: {'✅ ENABLED' if cfg.enable_cex else '❌ DISABLED'}"
+                        elif cb_data == "toggle_dex":
+                            cfg.enable_dex = not cfg.enable_dex
+                            msg = f"DEX Monitoring: {'✅ ENABLED' if cfg.enable_dex else '❌ DISABLED'}"
+                        elif cb_data == "toggle_trade":
+                            cfg.trade.enabled = not cfg.trade.enabled
+                            msg = f"Auto-Trading: {'▶️ ACTIVE' if cfg.trade.enabled else '⏸️ PAUSED'}"
+                        
+                        await send_tg_msg(session, cfg, f"⚙️ {msg}")
+                        # Acknowledge the callback to Telegram
+                        await session.post(f"https://api.telegram.org/bot{cfg.telegram_bot_token}/answerCallbackQuery", json={"callback_query_id": cb_query['id']})
+                        continue
+
                     msg = update.get("message", {})
                     text = msg.get("text", "")
                     chat_id = str(msg.get("chat", {}).get("id", ""))
                     if chat_id != cfg.telegram_chat_id: continue
 
                     if text == "/status":
-                        status_text = (f"🚀 *QuikPulse*\n"
-                                     f"CEX: `{cfg.enable_cex}` | DEX: `{cfg.enable_dex}`\n"
-                                     f"Auto-Trade: `{cfg.trade.enabled}`\n"
-                                     f"EMA: `{cfg.indicators.ema_short}/{cfg.indicators.ema_medium}`")
-                        await send_tg_msg(session, cfg, status_text)
+                        # Interactive Toggle Buttons
+                        keyboard = {
+                            "inline_keyboard": [
+                                [
+                                    {"text": f"CEX: {'✅' if cfg.enable_cex else '❌'}", "callback_data": "toggle_cex"},
+                                    {"text": f"DEX: {'✅' if cfg.enable_dex else '❌'}", "callback_data": "toggle_dex"}
+                                ],
+                                [
+                                    {"text": f"Auto-Trade: {'▶️' if cfg.trade.enabled else '⏸️'}", "callback_data": "toggle_trade"}
+                                ]
+                            ]
+                        }
+                        
+                        status_text = (f"🚀 *QuikPulse Control Center*\n"
+                                     f"Model: `{cfg.model_version}`\n"
+                                     f"EMA Strategy: `{cfg.indicators.ema_short}/{cfg.indicators.ema_medium}`")
+                        
+                        await session.post(
+                            f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage", 
+                            json={
+                                "chat_id": cfg.telegram_chat_id, 
+                                "text": status_text, 
+                                "parse_mode": "Markdown",
+                                "reply_markup": keyboard
+                            }
+                        )
+
+                    elif text == "/pnl":
+                        stats = await store.get_pnl_stats()
+                        if stats:
+                            pnl_msg = (f"💰 *Overall Performance*\n"
+                                      f"Total Trades: `{stats['total']}`\n"
+                                      f"✅ Wins: `{stats['wins']}`\n"
+                                      f"❌ Losses: `{stats['losses']}`\n"
+                                      f"📈 Win Rate: `{stats['win_rate']}%`")
+                            await send_tg_msg(session, cfg, pnl_msg)
+                        else: await send_tg_msg(session, cfg, "📊 No trade history found.")
+
+                    elif text == "/list":
+                        try:
+                            markets = await exchange.load_markets()
+                            usdt_pairs = [s for s in markets.keys() if ':USDT' in s]
+                            pair_list = "\n".join([f"`{p}`" for p in usdt_pairs[:40]])
+                            await send_tg_msg(session, cfg, f"📊 *Available Symbols:*\n{pair_list}\n\n_Showing top 40..._")
+                        except Exception as e: await send_tg_msg(session, cfg, f"❌ Exchange Error: `{e}`")
 
                     elif text.startswith("/pair"):
                         parts = text.split()
                         if len(parts) == 1:
-                            await send_tg_msg(session, cfg, f"🔍 *Monitoring:*\n`{', '.join(cfg.symbols)}`")
+                            await send_tg_msg(session, cfg, f"🔍 *Active Monitoring:*\n`{', '.join(cfg.symbols)}`")
                         elif len(parts) == 3:
                             action, target = parts[1].lower(), parts[2].upper()
                             if action == "add":
                                 if target not in cfg.symbols:
-                                    social = await sentinel.get_sentiment(target)
-                                    cfg.symbols.append(target)
-                                    await send_tg_msg(session, cfg, f"✅ Added `{target}`\nSlug: `{social['slug']}` | Sentiment: `{social['score']}`")
+                                    try:
+                                        await exchange.load_markets()
+                                        if target in exchange.markets:
+                                            social = await sentinel.get_sentiment(target)
+                                            cfg.symbols.append(target)
+                                            await send_tg_msg(session, cfg, f"✅ Added `{target}`\nSlug: `{social['slug']}` | Sentiment: `{social['score']}`")
+                                        else: await send_tg_msg(session, cfg, f"❌ `{target}` not on KuCoin.")
+                                    except: await send_tg_msg(session, cfg, "❌ Validation Error.")
                                 else: await send_tg_msg(session, cfg, f"ℹ️ `{target}` already active.")
                             elif action == "remove":
                                 if target in cfg.symbols:
@@ -478,6 +577,17 @@ async def telegram_command_listener(session: aiohttp.ClientSession, cfg: BotConf
                     elif text == "/resume": 
                         cfg.trade.enabled = True
                         await send_tg_msg(session, cfg, "▶️ Trading manually resumed.")
+                    
+                    elif text in ["/help", "/start"]:
+                        help_msg = ("💡 *QuikPulse AI Commands:*\n"
+                                   "• `/status` - Control center dashboard\n"
+                                   "• `/pnl` - Performance analytics\n"
+                                   "• `/list` - Show available symbols\n"
+                                   "• `/pair add [SYMBOL]` - Monitor new pair\n"
+                                   "• `/pair remove [SYMBOL]` - Stop monitoring\n"
+                                   "• `/set [param] [val]` - Update indicator settings\n"
+                                   "• `/resume` - Start auto-trading")
+                        await send_tg_msg(session, cfg, help_msg)
         except Exception as e: logger.error(f"TG Error: {e}")
         await asyncio.sleep(3)
 
@@ -520,12 +630,21 @@ async def notify_new_signal(sig, session, cfg_bot):
 # FastAPI App & Webhook Handler
 # -----------------------------
 app = FastAPI()
+templates = Jinja2Templates(directory="templates")
+
+# Globals
 cfg = BotConfig()
 store = SignalStore(cfg.sqlite_db)
 cluster_map = ClusterEngine(cfg.cluster_window_minutes)
 exchange = ccxt.kucoinfutures({"apiKey": os.getenv("API_KEY"), "secret": os.getenv("API_SECRET"), "password": os.getenv("API_PASS"), "enableRateLimit": True})
 session: Optional[aiohttp.ClientSession] = None
 generator: Optional[SignalGenerator] = None
+
+# Web Routes
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    signals = await store.get_latest_signals(limit=20)
+    return templates.TemplateResponse("index.html", {"request": request, "signals": signals})
 
 @app.post("/webhook")
 async def helius_webhook_handler(request: Request):
@@ -577,11 +696,16 @@ async def startup():
     if WEBHOOK_URL and cfg.tracked_wallets:
         await generator.helius.setup_webhooks(WEBHOOK_URL, cfg.tracked_wallets)
 
+    # Scheduler for Daily Summary
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(send_daily_report, 'cron', hour=8, minute=0, args=[session, cfg, store])
+    scheduler.start()
+
     asyncio.create_task(background_monitor())
     asyncio.create_task(generator.fetch_dex_alpha())
     asyncio.create_task(monitor.watch_signals())
     asyncio.create_task(risk_mgmt.check_performance_safety())
-    asyncio.create_task(telegram_command_listener(session, cfg, sentinel))
+    asyncio.create_task(telegram_command_listener(session, cfg, sentinel, store))
     asyncio.create_task(continuous_learning_loop(trainer))
     logger.info("QuikPulse: Production Ready.")
 
