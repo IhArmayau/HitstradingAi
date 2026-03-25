@@ -7,8 +7,9 @@ jinja2
 python-multipart
 aiohttp
 
-# Database & Storage
-aiosqlite
+# Database & Storage (PostgreSQL + SQLAlchemy)
+sqlalchemy
+asyncpg
 psycopg2-binary
 cloudinary
 
