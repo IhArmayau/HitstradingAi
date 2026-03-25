@@ -21,19 +21,21 @@ import uvicorn
 from sklearn.ensemble import RandomForestClassifier
 import san
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-# Import for PostgreSQL support
 import sqlalchemy
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, Integer, String, Float, Text, select, update, func
+from sqlalchemy import Column, Integer, String, Float, Text, select, update, delete, func
 
 # -----------------------------
 # Database Setup (PostgreSQL Ready)
 # -----------------------------
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
+if DATABASE_URL:
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
+    elif DATABASE_URL.startswith("postgresql://") and "+asyncpg" not in DATABASE_URL:
+        DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
 
 Base = declarative_base()
 
@@ -58,13 +60,20 @@ class SignalModel(Base):
     vol_liq_ratio = Column(Float, default=0.0)
     time_to_close = Column(Integer, nullable=True)
 
+class TrackedWallet(Base):
+    """Table to store wallets added via Telegram commands for persistence"""
+    __tablename__ = "tracked_wallets"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    address = Column(String, unique=True, nullable=False)
+    label = Column(String, nullable=True)
+    added_at = Column(String, default=lambda: datetime.now(timezone.utc).isoformat())
+
 # -----------------------------
 # Configs & Environment
 # -----------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
 SANTIMENT_API_KEY = os.getenv("SANTIMENT_API_KEY", "Eo6zp2wemnkb4cui_thgwsepbufktb4qz")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -110,11 +119,11 @@ class BotConfig:
     ml_model_path: str = os.getenv("ML_MODEL_PATH", "models")
     telegram_bot_token: Optional[str] = os.getenv("TELEGRAM_BOT_TOKEN")
     telegram_chat_id: Optional[str] = os.getenv("TELEGRAM_CHAT_ID")
-    model_version: str = os.getenv("MODEL_VERSION", "v5.2-prod")
+    model_version: str = os.getenv("MODEL_VERSION", "v5.9-alpha-hunter")
     tracked_wallets: List[str] = field(default_factory=lambda: [w.strip() for w in os.getenv("TRACKED_WALLETS", "").split(',') if w.strip()])
 
 # -----------------------------
-# Database Store (Refactored for PostgreSQL)
+# Database Store
 # -----------------------------
 class SignalStore:
     def __init__(self, db_url: str):
@@ -150,25 +159,57 @@ class SignalStore:
             result = await session.execute(q)
             return result.first() is not None
 
+    async def add_tracked_wallet(self, address: str):
+        async with self.async_session() as session:
+            try:
+                new_w = TrackedWallet(address=address)
+                session.add(new_w)
+                await session.commit()
+                return True
+            except: return False
+
+    async def remove_tracked_wallet(self, address: str):
+        async with self.async_session() as session:
+            await session.execute(delete(TrackedWallet).where(TrackedWallet.address == address))
+            await session.commit()
+
+    async def get_all_tracked_wallets(self) -> List[str]:
+        async with self.async_session() as session:
+            res = await session.execute(select(TrackedWallet.address))
+            return list(res.scalars().all())
+
     def get_symbol_lock(self, s):
         if s not in self.symbol_locks: self.symbol_locks[s] = asyncio.Lock()
         return self.symbol_locks[s]
 
-    async def get_pnl_stats(self, timeframe_hours: int = None):
-        async with self.async_session() as session:
-            query = select(func.count(SignalModel.id), func.sum(sqlalchemy.case((SignalModel.status == 'win', 1), else_=0))).where(SignalModel.status.in_(['win', 'loss']))
-            if timeframe_hours:
-                since = (datetime.now(timezone.utc) - timedelta(hours=timeframe_hours)).isoformat()
-                query = query.where(SignalModel.timestamp > since)
-            result = await session.execute(query)
-            row = result.first()
-            if not row or row[0] == 0: return None
-            total, wins = row[0], row[1] or 0
-            return {"total": total, "wins": wins, "losses": total - wins, "win_rate": round((wins/total)*100, 2)}
+# -----------------------------
+# Intelligence Engines
+# -----------------------------
+class DiscoveryHunter:
+    def __init__(self, helius_key: str, session: aiohttp.ClientSession, cfg: BotConfig):
+        self.helius_key = helius_key
+        self.session = session
+        self.cfg = cfg
+        self.known_exchanges = ["Binance", "Kraken", "Coinbase", "OKX", "Bybit", "KuCoin", "Gate.io"]
 
-# -----------------------------
-# Intelligence Engines (Logic Preserved)
-# -----------------------------
+    async def is_whale_funded(self, wallet_address: str) -> bool:
+        if not self.helius_key or not wallet_address: return False
+        url = f"https://api.helius.xyz/v1/identities?api-key={self.helius_key}"
+        try:
+            async with self.session.post(url, json={"query": {"addresses": [wallet_address]}}) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    for item in data.get("identities", []):
+                        if any(ex.lower() in item.get("name", "").lower() for ex in self.known_exchanges):
+                            logger.info(f"🐋 WHALE DETECTED: {wallet_address} funded by {item.get('name')}")
+                            return True
+        except Exception as e:
+            logger.error(f"Whale Check Error: {e}")
+        return False
+
+    async def scan_for_insiders(self, token_address: str):
+        pass 
+
 class SocialSentinel:
     def __init__(self, api_key: str, session: aiohttp.ClientSession):
         self.api_key, self.session = api_key, session
@@ -219,16 +260,13 @@ class SecurityEngine:
         return {"safety_score": score, "is_rugged": vl_ratio > 10.0, "vl_ratio": vl_ratio}
 
 # -----------------------------
-# Signal Generation (Logic Preserved)
+# Signal Generation
 # -----------------------------
 class SignalGenerator:
     def __init__(self, cfg: BotConfig, store: SignalStore, ex: ccxt.Exchange, sentinel: SocialSentinel, cluster: ClusterEngine, session: aiohttp.ClientSession):
         self.cfg, self.store, self.exchange, self.sentinel, self.cluster, self.session = cfg, store, ex, sentinel, cluster, session
         self.dex, self.security = DexEngine(session), SecurityEngine(session)
-        self.last_signal_time = {}
-
-    async def get_ml_confidence(self, symbol: str, features: list) -> float:
-        return 75.0 # Placeholder for preserved logic
+        self.hunter = DiscoveryHunter(HELIUS_API_KEY, session, cfg)
 
     async def generate_cex_signal(self, symbol: str, btc_bullish: bool):
         now = datetime.now(timezone.utc)
@@ -253,7 +291,7 @@ class SignalGenerator:
             except: pass
 
 # -----------------------------
-# FastAPI App (Fixed for Render)
+# FastAPI App
 # -----------------------------
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
@@ -270,26 +308,103 @@ async def index(request: Request):
         signals = await store.get_latest_signals(limit=20)
         return templates.TemplateResponse("index.html", {"request": request, "signals": signals})
     except Exception as e:
-        logger.error(f"Dashboard Error: {e}")
-        return HTMLResponse("<html><body><h1>Database Syncing...</h1><p>Please refresh in 30 seconds.</p></body></html>")
+        return HTMLResponse("<html><body><h1>Database Syncing...</h1></body></html>")
 
 @app.post("/webhook")
 async def helius_webhook_handler(request: Request):
-    data = await request.json()
-    # Preserved webhook processing logic
-    return {"status": "success"}
+    try:
+        data = await request.json()
+        db_wallets = await store.get_all_tracked_wallets()
+        master_tracked = list(set(cfg.tracked_wallets + db_wallets))
+
+        for event in data:
+            tx_type = event.get("type")
+            if tx_type != "SWAP": continue
+            
+            swap_info = event.get("events", {}).get("swap", {})
+            token_address = swap_info.get("tokenOutMint")
+            buyer_wallet = event.get("feePayer")
+            
+            if not token_address: continue
+
+            is_whale = await generator.hunter.is_whale_funded(buyer_wallet)
+            is_manual_sniper = buyer_wallet in master_tracked
+            
+            cluster_count = cluster_map.record_and_check(token_address)
+            dex_data = await generator.dex.get_price_data(token_address)
+            security_report = await generator.security.get_safety_report(token_address, dex_data['vol24'], dex_data['liq'])
+
+            trigger_signal = False
+            confidence = 85.0
+            
+            if is_manual_sniper:
+                trigger_signal, confidence = True, 100.0
+            elif is_whale:
+                trigger_signal, confidence = True, 95.0
+            elif cluster_count >= 2:
+                trigger_signal = True
+
+            if trigger_signal and security_report['safety_score'] >= cfg.trade.min_safety_score:
+                if not await store.has_open_signal(token_address):
+                    sig = {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "symbol": dex_data['symbol'], "market_type": "DEX", "contract_address": token_address,
+                        "signal": "BUY", "entry": dex_data['price'], "confidence": confidence,
+                        "safety_score": security_report['safety_score'], "vol_liq_ratio": security_report['vl_ratio'],
+                        "is_cluster": 1 if cluster_count >= 2 else 0, "model_version": cfg.model_version
+                    }
+                    await store.insert_signal(sig)
+                    await notify_new_signal(sig, session, cfg, is_whale=is_whale, is_sniper=is_manual_sniper)
+
+        return {"status": "success"}
+    except Exception as e:
+        logger.error(f"Webhook Error: {e}")
+        return {"status": "error"}
+
+@app.post("/tg-webhook")
+async def telegram_command_handler(request: Request):
+    """Processes /add, /remove, and /list commands from Telegram Webhook"""
+    try:
+        data = await request.json()
+        if "message" not in data: return {"ok": True}
+        
+        text = data["message"].get("text", "")
+        chat_id = data["message"]["chat"]["id"]
+
+        if str(chat_id) != cfg.telegram_chat_id: return {"ok": True}
+
+        if text.startswith("/add "):
+            wallet = text.split(" ")[1].strip()
+            success = await store.add_tracked_wallet(wallet)
+            msg = f"✅ Added to Sniper List:\n`{wallet}`" if success else "⚠️ Already being tracked."
+            await send_direct_tg(msg)
+
+        elif text.startswith("/remove "):
+            wallet = text.split(" ")[1].strip()
+            await store.remove_tracked_wallet(wallet)
+            await send_direct_tg(f"❌ Removed from Sniper List:\n`{wallet}`")
+
+        elif text == "/list":
+            wallets = await store.get_all_tracked_wallets()
+            if not wallets:
+                await send_direct_tg("📭 Your Sniper List is currently empty.")
+            else:
+                list_msg = "🎯 **Active Sniper Wallets:**\n\n" + "\n".join([f"• `{w}`" for w in wallets])
+                await send_direct_tg(list_msg)
+
+        return {"ok": True}
+    except:
+        return {"ok": True}
 
 @app.on_event("startup")
 async def startup():
     global session, generator
-    await store.init_db() # Forces table creation on Aiven
+    await store.init_db()
     session = aiohttp.ClientSession()
     sentinel = SocialSentinel(SANTIMENT_API_KEY, session)
     generator = SignalGenerator(cfg, store, exchange, sentinel, cluster_map, session)
-    
-    # Task Scheduling
     asyncio.create_task(background_monitor())
-    logger.info("QuikPulse: Production Ready on Render.")
+    logger.info("QuikPulse AI Live on Render.")
 
 async def background_monitor():
     while True:
@@ -300,11 +415,18 @@ async def background_monitor():
         except: pass
         await asyncio.sleep(cfg.poll_interval)
 
-async def notify_new_signal(sig, session, cfg):
+async def notify_new_signal(sig, session, cfg, is_whale=False, is_sniper=False):
     if not cfg.telegram_bot_token: return
-    msg = f"🚀 *NEW SIGNAL*\nPair: `{sig['symbol']}`\nType: {sig['signal']}\nPrice: `${sig['entry']}`"
+    prefix = "🎯 *SNIPER SIGNAL*" if is_sniper else "🐋 *WHALE SIGNAL*" if is_whale else "🚀 *NEW SIGNAL*"
+    msg = f"{prefix}\nPair: `{sig['symbol']}`\nType: {sig['signal']}\nPrice: `${sig['entry']}`\nConfidence: {sig['confidence']}%"
     try: await session.post(f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage", json={"chat_id": cfg.telegram_chat_id, "text": msg, "parse_mode": "Markdown"})
     except: pass
+
+async def send_direct_tg(text: str):
+    url = f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage"
+    payload = {"chat_id": cfg.telegram_chat_id, "text": text, "parse_mode": "Markdown"}
+    async with session.post(url, json=payload) as resp:
+        return await resp.json()
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
