@@ -20,6 +20,7 @@ pandas
 numpy
 scikit-learn
 joblib
+tensorflow-cpu
 
 # Intelligence & Social API
 sanpy

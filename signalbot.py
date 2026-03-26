@@ -26,6 +26,13 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import Column, Integer, String, Float, Text, select, delete
 
+# Import for .h5 support
+try:
+    from tensorflow.keras.models import load_model as load_keras_model
+    HAS_TF = True
+except ImportError:
+    HAS_TF = False
+
 # -----------------------------
 # Logging Configuration
 # -----------------------------
@@ -131,7 +138,8 @@ class BotConfig:
     min_insider_buy_sol: float = float(os.getenv("MIN_INSIDER_BUY_SOL", 2.0))
     indicators: IndicatorsConfig = field(default_factory=IndicatorsConfig)
     trade: TradeConfig = field(default_factory=TradeConfig)
-    ml_model_path: str = os.getenv("ML_MODEL_PATH", "models/latest_model.pkl")
+    # Updated path to match your current file
+    ml_model_path: str = os.getenv("ML_MODEL_PATH", "models/lstm_model.h5")
     telegram_bot_token: Optional[str] = os.getenv("TELEGRAM_BOT_TOKEN")
     telegram_chat_id: Optional[str] = os.getenv("TELEGRAM_CHAT_ID")
     model_version: str = "v6.1-pro-prod-signal"
@@ -233,7 +241,7 @@ class DiscoveryHunter:
         try:
             data = await request_with_retry(self.session, "POST", url, json={"query": {"addresses": [wallet_address]}})
             for item in data.get("identities", []):
-                if any(ex.lower() in item.get("name", "").lower() for x in self.known_exchanges): return True
+                if any(ex.lower() in item.get("name", "").lower() for ex in self.known_exchanges): return True
         except: return False
         return False
 
@@ -316,16 +324,35 @@ class SignalGenerator:
         self.ml_model = self._load_model()
 
     def _load_model(self):
+        """Modified to support Keras .h5 models."""
+        path = self.cfg.ml_model_path
         try:
-            if os.path.exists(self.cfg.ml_model_path):
-                with open(self.cfg.ml_model_path, 'rb') as f: return pickle.load(f)
+            if os.path.exists(path) and os.path.isfile(path):
+                if path.endswith('.h5'):
+                    if HAS_TF:
+                        return load_keras_model(path)
+                    else:
+                        logger.error("TensorFlow not installed. Cannot load .h5 model.")
+                else:
+                    # Fallback for .pkl files
+                    with open(path, 'rb') as f:
+                        return pickle.load(f)
+            else:
+                logger.warning(f"Model file not found at: {path}. Using heuristic confidence.")
         except Exception as e:
-            logger.error(f"Error loading ML model: {e}")
+            logger.error(f"Error loading model at {path}: {e}")
         return None
 
     def predict_confidence(self, features: list) -> float:
         if self.ml_model:
-            try: return float(self.ml_model.predict_proba([features])[0][1] * 100)
+            try:
+                if self.cfg.ml_model_path.endswith('.h5'):
+                    # LSTM/Keras prediction logic
+                    pred = self.ml_model.predict(np.array([features]))
+                    return float(pred[0][0] * 100)
+                else:
+                    # Scikit-learn logic
+                    return float(self.ml_model.predict_proba([features])[0][1] * 100)
             except: return 50.0
         return 70.0
 
@@ -481,6 +508,7 @@ async def telegram_command_handler(request: Request):
         message = data["message"]
         text = message.get("text", "").strip()
         parts = text.split()
+        if not parts: return JSONResponse({"status": "ignored"})
         cmd = parts[0].lower()
 
         # 1. /status - View dashboard & settings
@@ -584,8 +612,9 @@ async def centralized_dex_watcher():
 @app.on_event("startup")
 async def startup():
     global session, generator
-    if not os.path.exists(cfg.ml_model_path):
-         logger.warning(f"CRITICAL: ML model path {cfg.ml_model_path} missing.")
+    # Pre-startup model check updated to look for file
+    if not os.path.exists(cfg.ml_model_path) or not os.path.isfile(cfg.ml_model_path):
+         logger.warning(f"CRITICAL: ML model file {cfg.ml_model_path} missing or is a directory. Bot will run with default confidence.")
          
     await store.init_db()
     session = aiohttp.ClientSession()
@@ -654,3 +683,4 @@ if __name__ == "__main__":
         log_level="info",
         access_log=True
     )
+
