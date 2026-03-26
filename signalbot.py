@@ -385,17 +385,17 @@ async def health():
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     try:
-        signals_data = await store.get_latest_signals()
-        # FIXED: Pass a flat dictionary to avoid hashing conflict errors in Starlette/Jinja2
-        return templates.TemplateResponse(
-            "index.html", 
-            {
-                "request": request,
-                "signals": signals_data,
-                "bot_status": "ONLINE",
-                "version": cfg.model_version
-            }
-        )
+        # Fetch data and ensure it's a serializable list of dicts
+        raw_signals = await store.get_latest_signals()
+        
+        # Explicitly building context as a flat dict to prevent "unhashable" template errors
+        template_context = {
+            "request": request,
+            "signals": raw_signals,
+            "bot_status": "ONLINE",
+            "version": cfg.model_version
+        }
+        return templates.TemplateResponse("index.html", template_context)
     except Exception as e:
         logger.error(f"Template Render Error: {e}")
         return HTMLResponse(content=f"Dashboard Rendering Error: {str(e)}", status_code=500)
