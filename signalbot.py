@@ -16,7 +16,7 @@ import aiohttp
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.templating import Jinja2Templates
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 from sklearn.ensemble import RandomForestClassifier
 import san
@@ -86,7 +86,7 @@ if SANTIMENT_API_KEY:
 
 @dataclass
 class TradeConfig:
-    enabled: bool = False  # Set to False for Signal-Only Production
+    enabled: bool = False
     max_position_size_usd: float = float(os.getenv("MAX_POS_SIZE", 50.0))
     min_safety_score: float = float(os.getenv("MIN_SAFETY_SCORE", 70.0))
     min_sentiment_score: float = 60.0
@@ -144,7 +144,8 @@ async def request_with_retry(session: aiohttp.ClientSession, method: str, url: s
 # -----------------------------
 class SignalStore:
     def __init__(self, db_url: str):
-        self.engine = create_async_engine(db_url, pool_size=10, max_overflow=20)
+        # Increased pool size for Render performance
+        self.engine = create_async_engine(db_url, pool_size=10, max_overflow=20, pool_pre_ping=True)
         self.async_session = sessionmaker(self.engine, expire_on_commit=False, class_=AsyncSession)
         self.symbol_locks = {}
 
@@ -273,7 +274,6 @@ class TradeExecutor:
         self.cfg = cfg
 
     async def execute_trade(self, sig: dict):
-        # Purely informative for production signal bot
         logger.info(f"📣 [SIGNAL] {sig['market_type']} | {sig['symbol']} | {sig['signal']} @ {sig['entry']}")
 
 class SignalGenerator:
@@ -380,18 +380,32 @@ async def health():
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    signals = await store.get_latest_signals()
-    return templates.TemplateResponse("index.html", {"request": request, "signals": signals, "bot_status": "ONLINE", "version": cfg.model_version})
+    try:
+        signals_data = await store.get_latest_signals()
+        # FIX: Explicitly defined context as named argument to avoid Jinja 3.13 hashing error
+        context = {
+            "request": request,
+            "signals": signals_data,
+            "bot_status": "ONLINE",
+            "version": cfg.model_version
+        }
+        return templates.TemplateResponse(name="index.html", context=context)
+    except Exception as e:
+        logger.error(f"Template Render Error: {e}")
+        return HTMLResponse(content="Dashboard Rendering Error", status_code=500)
 
 @app.post("/webhook")
 async def helius_webhook(request: Request):
     try:
         data = await request.json()
+        logger.info(f"Webhook Received: {len(data) if isinstance(data, list) else 1} events")
+        
         db_wallets = await store.get_all_tracked_wallets_detailed()
         for event in data:
             if event.get("type") != "SWAP": continue
             swap = event.get("events", {}).get("swap", {})
             mint, buyer = swap.get("tokenOutMint"), event.get("feePayer")
+            
             is_whale = await generator.hunter.is_whale_funded(buyer)
             is_sniper = buyer in db_wallets
 
@@ -409,8 +423,11 @@ async def helius_webhook(request: Request):
                     task = asyncio.create_task(monitor_dex_exit(mint, float(dex_data['price'])))
                     background_tasks.add(task)
                     task.add_done_callback(background_tasks.discard)
-        return {"status": "success"}
-    except: return {"status": "error"}
+        # FIX: Return JSONResponse for webhooks to avoid Jinja involvement
+        return JSONResponse(content={"status": "success"}, status_code=200)
+    except Exception as e: 
+        logger.error(f"Webhook Error: {e}")
+        return JSONResponse(content={"status": "error", "message": str(e)}, status_code=500)
 
 async def monitor_dex_exit(mint: str, entry: float):
     generator.active_monitors.add(mint)
