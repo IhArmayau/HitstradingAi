@@ -82,7 +82,7 @@ class SignalModel(Base):
     is_cluster = Column(Integer, default=0)
     status = Column(String, default='open')
     model_version = Column(String)
-    vol_liq_ratio = Column(Float, default=0.0) 
+    vol_liq_ratio = Column(Float, default=0.0)
     time_to_close = Column(Integer, nullable=True)
 
 class TrackedWallet(Base):
@@ -138,7 +138,6 @@ class BotConfig:
     min_insider_buy_sol: float = float(os.getenv("MIN_INSIDER_BUY_SOL", 2.0))
     indicators: IndicatorsConfig = field(default_factory=IndicatorsConfig)
     trade: TradeConfig = field(default_factory=TradeConfig)
-    # Updated path to match your current file
     ml_model_path: str = os.getenv("ML_MODEL_PATH", "models/lstm_model.h5")
     telegram_bot_token: Optional[str] = os.getenv("TELEGRAM_BOT_TOKEN")
     telegram_chat_id: Optional[str] = os.getenv("TELEGRAM_CHAT_ID")
@@ -170,7 +169,7 @@ class SignalStore:
         self.engine = create_async_engine(db_url, pool_pre_ping=True, pool_recycle=1800)
         self.async_session = sessionmaker(self.engine, expire_on_commit=False, class_=AsyncSession)
         self.symbol_locks = {}
-        self.wallet_cache = {} # In-memory cache for high-performance webhook lookups
+        self.wallet_cache = {} 
 
     async def init_db(self):
         async with self.engine.begin() as conn:
@@ -318,27 +317,26 @@ class SignalGenerator:
         self.dex, self.security = DexEngine(session), SecurityEngine(session)
         self.hunter = DiscoveryHunter(HELIUS_API_KEY, session, cfg)
         self.executor = TradeExecutor(cfg)
-        self.active_monitors_data: Dict[str, float] = {} 
+        self.active_monitors_data: Dict[str, float] = {}
         self.cooldown_cache = {}
         self.prev_oi = {}
         self.ml_model = self._load_model()
 
     def _load_model(self):
-        """Modified to support Keras .h5 models."""
         path = self.cfg.ml_model_path
         try:
-            if os.path.exists(path) and os.path.isfile(path):
-                if path.endswith('.h5'):
-                    if HAS_TF:
+            if os.path.exists(path) and os.path.isfile(path) and os.path.getsize(path) > 100:
+                if path.endswith('.h5') and HAS_TF:
+                    try:
                         return load_keras_model(path)
-                    else:
-                        logger.error("TensorFlow not installed. Cannot load .h5 model.")
-                else:
-                    # Fallback for .pkl files
+                    except Exception as tf_err:
+                        logger.warning(f"TF Load failed (mock or corrupt file): {tf_err}. Using Heuristic Mode.")
+                        return None
+                elif not path.endswith('.h5'):
                     with open(path, 'rb') as f:
                         return pickle.load(f)
             else:
-                logger.warning(f"Model file not found at: {path}. Using heuristic confidence.")
+                logger.warning(f"Model file {path} missing, empty, or mock. Using Heuristic Mode.")
         except Exception as e:
             logger.error(f"Error loading model at {path}: {e}")
         return None
@@ -347,11 +345,9 @@ class SignalGenerator:
         if self.ml_model:
             try:
                 if self.cfg.ml_model_path.endswith('.h5'):
-                    # LSTM/Keras prediction logic
-                    pred = self.ml_model.predict(np.array([features]))
+                    pred = self.ml_model.predict(np.array([features]), verbose=0)
                     return float(pred[0][0] * 100)
                 else:
-                    # Scikit-learn logic
                     return float(self.ml_model.predict_proba([features])[0][1] * 100)
             except: return 50.0
         return 70.0
@@ -379,7 +375,7 @@ class SignalGenerator:
     async def generate_cex_signal(self, symbol: str):
         if self.cooldown_cache.get(symbol) and (datetime.now() - self.cooldown_cache[symbol]) < timedelta(minutes=self.cfg.trade.signal_cooldown_minutes):
             return
-        
+
         async with self.store.get_symbol_lock(symbol):
             try:
                 btc_trend = await self.get_btc_trend_filter()
@@ -410,7 +406,7 @@ class SignalGenerator:
                         "confidence": self.predict_confidence([funding, social['score']]),
                         "sentiment_score": social['score'], "funding": funding, "open_interest": oi,
                         "model_version": self.cfg.model_version,
-                        "vol_liq_ratio": 0.0 
+                        "vol_liq_ratio": 0.0
                     }
                     await self.store.insert_signal(sig)
                     self.cooldown_cache[symbol] = datetime.now()
@@ -461,14 +457,14 @@ async def helius_webhook(request: Request):
         body = await request.body()
         data = json.loads(body)
         logger.info(f"🔗 [WEBHOOK] Batch Received: {len(data)} events.")
-        
+
         db_wallets = store.wallet_cache
-        
+
         for event in data:
             if event.get("type") != "SWAP": continue
             swap = event.get("events", {}).get("swap", {})
             mint, buyer = swap.get("tokenOutMint"), event.get("feePayer")
-            
+
             is_whale = await generator.hunter.is_whale_funded(buyer)
             is_sniper = buyer in db_wallets
 
@@ -476,11 +472,11 @@ async def helius_webhook(request: Request):
                 logger.info(f"🎯 [MATCH] Sniper/Whale: {buyer} buying {mint}")
                 dex_data = await generator.dex.get_price_data(mint)
                 safety = await generator.security.get_safety_report(mint, dex_data['vol24'], dex_data['liq'])
-                
+
                 sig = {
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "symbol": dex_data['symbol'], "market_type": "DEX", "contract_address": mint,
-                    "signal": "BUY", "entry": dex_data['price'], "confidence": 95.0, 
+                    "signal": "BUY", "entry": dex_data['price'], "confidence": 95.0,
                     "model_version": cfg.model_version,
                     "vol_liq_ratio": safety['vl_ratio'],
                     "safety_score": safety['safety_score']
@@ -488,18 +484,17 @@ async def helius_webhook(request: Request):
                 await store.insert_signal(sig)
                 await generator.executor.execute_trade(sig)
                 await notify_new_signal(sig, session, cfg, is_whale=is_whale, is_sniper=is_sniper)
-                
+
                 if mint not in generator.active_monitors_data:
                     generator.active_monitors_data[mint] = float(dex_data['price'])
-                    
+
         return JSONResponse(content={"status": "success"}, status_code=200)
-    except Exception as e: 
+    except Exception as e:
         logger.error(f"❌ Webhook Processing Failure: {e}")
         return JSONResponse(content={"status": "error"}, status_code=500)
 
 @app.post("/tg-webhook")
 async def telegram_command_handler(request: Request):
-    """Processes interactive commands from Telegram via Webhook"""
     try:
         data = await request.json()
         if "message" not in data or "text" not in data["message"]:
@@ -511,7 +506,6 @@ async def telegram_command_handler(request: Request):
         if not parts: return JSONResponse({"status": "ignored"})
         cmd = parts[0].lower()
 
-        # 1. /status - View dashboard & settings
         if cmd == "/status":
             dex_count = len(generator.active_monitors_data)
             msg = (f"📊 **QuikPulse AI Dashboard**\n"
@@ -522,12 +516,10 @@ async def telegram_command_handler(request: Request):
                    f"• Wallets: `{len(store.wallet_cache)}` in cache")
             await send_direct_tg(msg)
 
-        # 2. /list - Show monitored symbols
         elif cmd == "/list":
             msg = f"📋 **Monitored Symbols:**\n`{', '.join(cfg.symbols)}`"
             await send_direct_tg(msg)
 
-        # 3. /pair - Add or remove pairs
         elif cmd == "/pair":
             if len(parts) < 3:
                 await send_direct_tg("⚠️ Usage: `/pair add BTC/USDT:USDT` or `/pair remove BTC/USDT:USDT` ")
@@ -540,7 +532,6 @@ async def telegram_command_handler(request: Request):
                     if pair in cfg.symbols: cfg.symbols.remove(pair)
                     await send_direct_tg(f"🗑️ Removed `{pair}` from monitor.")
 
-        # 4. /addwallet - Track a new wallet address
         elif cmd == "/addwallet":
             if len(parts) < 2:
                 await send_direct_tg("⚠️ Usage: `/addwallet [address] [label]`")
@@ -553,7 +544,6 @@ async def telegram_command_handler(request: Request):
                 await store.refresh_wallet_cache()
                 await send_direct_tg(f"🎯 **Wallet Tracked:**\n`{addr}` ({label})")
 
-        # 5. /remwallet - Remove a wallet address
         elif cmd == "/remwallet":
             if len(parts) < 2:
                 await send_direct_tg("⚠️ Usage: `/remwallet [address]`")
@@ -565,12 +555,10 @@ async def telegram_command_handler(request: Request):
                 await store.refresh_wallet_cache()
                 await send_direct_tg(f"🗑️ **Wallet Removed:**\n`{addr}`")
 
-        # 6. /resume - Start auto-trading
         elif cmd == "/resume":
             cfg.trade.enabled = True
             await send_direct_tg("🚀 **Auto-Trading Resumed.** Execution engine is live.")
 
-        # 7. /help - Show instruction guide
         elif cmd == "/help":
             guide = ("🤖 **QuikPulse Command Guide**\n"
                      "• `/status` - Dashboard\n"
@@ -593,16 +581,16 @@ async def centralized_dex_watcher():
             for mint, entry in tokens_to_check:
                 data = await generator.dex.get_price_data(mint)
                 if data['price'] <= 0: continue
-                
+
                 if data['price'] >= entry * 1.5:
                     await send_direct_tg(f"💰 **DEX TP**\nToken: `{data['symbol']}`\nGain: `+50%`")
                     generator.active_monitors_data.pop(mint, None)
                 elif data['price'] <= entry * 0.8:
                     await send_direct_tg(f"⚠️ **DEX SL**\nToken: `{data['symbol']}`\nLoss: `-20%`")
                     generator.active_monitors_data.pop(mint, None)
-                
+
                 await asyncio.sleep(2)
-                
+
             await asyncio.sleep(60)
         except asyncio.CancelledError: break
         except Exception as e:
@@ -612,32 +600,27 @@ async def centralized_dex_watcher():
 @app.on_event("startup")
 async def startup():
     global session, generator
-    # Pre-startup model check updated to look for file
-    if not os.path.exists(cfg.ml_model_path) or not os.path.isfile(cfg.ml_model_path):
-         logger.warning(f"CRITICAL: ML model file {cfg.ml_model_path} missing or is a directory. Bot will run with default confidence.")
-         
     await store.init_db()
     session = aiohttp.ClientSession()
     sentinel = SocialSentinel(SANTIMENT_API_KEY, session)
     generator = SignalGenerator(cfg, store, exchange, sentinel, cluster_map, session)
-    
-    # Register Telegram Webhook automatically on Render
+
     public_url = os.getenv("RENDER_EXTERNAL_URL")
     if public_url and cfg.telegram_bot_token:
         webhook_url = f"{public_url}/tg-webhook"
         setup_url = f"https://api.telegram.org/bot{cfg.telegram_bot_token}/setWebhook?url={webhook_url}"
         async with session.get(setup_url) as resp:
             logger.info(f"Telegram Webhook Status: {await resp.json()}")
-    
+
     async def wallet_refresh_loop():
         while True:
             await asyncio.sleep(1800)
             await store.refresh_wallet_cache()
-            
+
     monitor_task = asyncio.create_task(background_monitor())
     dex_watcher_task = asyncio.create_task(centralized_dex_watcher())
     refresh_task = asyncio.create_task(wallet_refresh_loop())
-    
+
     background_tasks.add(monitor_task)
     background_tasks.add(dex_watcher_task)
     background_tasks.add(refresh_task)
@@ -676,11 +659,13 @@ async def send_direct_tg(text: str):
         logger.error(f"Telegram Send Error: {e}")
 
 if __name__ == "__main__":
+    # Fixed deployment block for Render
+    port = int(os.environ.get("PORT", 10000))
+    print(f"Binding QuikPulse to Port: {port}")
     uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=int(os.getenv("PORT", 8000)),
+        "signalbot:app", # Run by name for process stability
+        host="0.0.0.0",
+        port=port,
         log_level="info",
         access_log=True
     )
-
