@@ -22,7 +22,7 @@ import san
 from pathlib import Path
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, Integer, String, Float, Text, select, delete
+from sqlalchemy import Column, Integer, String, Float, Text, select, delete, func
 
 # Import for .h5 support
 try:
@@ -63,9 +63,9 @@ class SignalModel(Base):
     __tablename__ = "signals"
     id = Column(Integer, primary_key=True, autoincrement=True)
     timestamp = Column(String)
-    symbol = Column(String)
+    symbol = Column(String, index=True)
     market_type = Column(String)
-    contract_address = Column(String, nullable=True)
+    contract_address = Column(String, nullable=True, index=True)
     signal = Column(String)
     entry = Column(Float)
     sl = Column(Float, nullable=True)
@@ -84,17 +84,18 @@ class SignalModel(Base):
 class TrackedWallet(Base):
     __tablename__ = "tracked_wallets"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    address = Column(String, unique=True, nullable=False)
+    address = Column(String, unique=True, nullable=False, index=True)
     label = Column(String, nullable=True)
     added_at = Column(String, default=lambda: datetime.now(timezone.utc).isoformat())
 
 class WalletCandidate(Base):
     __tablename__ = "wallet_candidates"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    address = Column(String, nullable=False)
+    address = Column(String, nullable=False, index=True)
     token_mint = Column(String, nullable=False)
     entry_price = Column(Float)
     timestamp = Column(String, default=lambda: datetime.now(timezone.utc).isoformat())
+    is_win = Column(Integer, default=0)
 
 class MonitoredPair(Base):
     __tablename__ = "monitored_pairs"
@@ -111,6 +112,7 @@ class BotSetting(Base):
 # -----------------------------
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
 ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY", "")
+ALCHEMY_WEBHOOK_ID = os.getenv("ALCHEMY_WEBHOOK_ID", "") # Required for auto-sync
 ALCHEMY_RPC_URL = f"https://solana-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
 SANTIMENT_API_KEY = os.getenv("SANTIMENT_API_KEY", "Eo6zp2wemnkb4cui_thgwsepbufktb4qz")
 
@@ -148,12 +150,13 @@ class BotConfig:
     cluster_window_minutes: int = 30
     min_insider_buy_sol: float = float(os.getenv("MIN_INSIDER_BUY_SOL", 2.0))
     min_hunter_profit_mult: float = 3.0
+    min_hunter_wins_required: int = 3 
     indicators: IndicatorsConfig = field(default_factory=IndicatorsConfig)
     trade: TradeConfig = field(default_factory=TradeConfig)
     ml_model_path: str = os.getenv("ML_MODEL_PATH", "models/lstm_model.h5")
     telegram_bot_token: Optional[str] = os.getenv("TELEGRAM_BOT_TOKEN")
     telegram_chat_id: Optional[str] = os.getenv("TELEGRAM_CHAT_ID")
-    model_version: str = "v7.5-pro-hunter-mode"
+    model_version: str = "v7.6-helius-proof"
 
 # -----------------------------
 # Production Utility: API Resilience
@@ -208,12 +211,14 @@ class SignalStore:
             await session.merge(TrackedWallet(address=address, label=label))
             await session.commit()
             await self.refresh_wallet_cache()
+            await sync_alchemy_webhook(list(self.wallet_cache.keys()))
 
     async def remove_tracked_wallet(self, address: str):
         async with self.async_session() as session:
             await session.execute(delete(TrackedWallet).where(TrackedWallet.address == address))
             await session.commit()
             await self.refresh_wallet_cache()
+            await sync_alchemy_webhook(list(self.wallet_cache.keys()))
 
     async def remove_cex_pair(self, symbol: str):
         async with self.async_session() as session:
@@ -257,6 +262,22 @@ class SignalStore:
         async with self.async_session() as session:
             res = await session.execute(select(TrackedWallet.address, TrackedWallet.label))
             return {str(row[0]): (str(row[1]) if row[1] else str(row[0])[:6]) for row in res.all()}
+
+# -----------------------------
+# Alchemy Sync Utility
+# -----------------------------
+async def sync_alchemy_webhook(addresses: List[str]):
+    """Keeps Alchemy Webhook in sync with Helius/Database Tracked Wallets"""
+    if not ALCHEMY_API_KEY or not ALCHEMY_WEBHOOK_ID: return
+    url = f"https://dashboard.alchemy.com/api/update-webhook-addresses"
+    headers = {"X-Alchemy-Token": ALCHEMY_API_KEY, "Content-Type": "application/json"}
+    payload = {"webhook_id": ALCHEMY_WEBHOOK_ID, "addresses_to_add": addresses, "addresses_to_remove": []}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.patch(url, json=payload, headers=headers) as resp:
+                logger.info(f"Alchemy Sync Status: {resp.status}")
+    except Exception as e:
+        logger.error(f"Alchemy Sync Failed: {e}")
 
 # -----------------------------
 # Intelligence Engines
@@ -447,7 +468,6 @@ async def startup():
     global session, generator
     await store.init_db()
 
-    # Sync CEX pairs from Database for persistence
     async with store.async_session() as session_db:
         result = await session_db.execute(select(MonitoredPair.symbol))
         db_pairs = result.scalars().all()
@@ -480,28 +500,46 @@ async def shutdown():
 
 @app.post("/webhook")
 async def combined_webhook_handler(request: Request):
+    """
+    Enhanced Webhook Handler: Supports both Helius and Alchemy Notify
+    """
     try:
         data = await request.json()
         db_wallets = store.wallet_cache
+
+        # 1. ALCHEMY NOTIFY PARSER (Takeover)
         if isinstance(data, dict) and "event" in data:
             for act in data.get("event", {}).get("activity", []):
                 buyer = act.get("fromAddress")
+                # Look for the contract address in logs or asset details
                 mint = act.get("rawContract", {}).get("address")
                 if not mint or not buyer: continue
+                
+                # Deduplication: Check if we are already in this trade
+                if await store.has_open_signal(mint): continue
+
                 dex_info = await generator.dex.get_price_data(mint)
                 await store.insert_candidate(buyer, mint, dex_info['price'])
                 is_whale = await generator.hunter.is_whale_funded(buyer)
                 is_sniper = buyer in db_wallets
-                if (is_sniper or is_whale) and not await store.has_open_signal(mint):
+                
+                if is_sniper or is_whale:
                     await process_dex_signal(mint, buyer, is_whale, is_sniper)
+
+        # 2. HELIUS WEBHOOK PARSER (Original)
         elif isinstance(data, list):
             for event in data:
                 if event.get("type") != "SWAP": continue
                 swap = event.get("events", {}).get("swap", {})
                 mint, buyer = swap.get("tokenOutMint"), event.get("feePayer")
+                
+                # Deduplication
+                if await store.has_open_signal(mint): continue
+
                 is_whale, is_sniper = await generator.hunter.is_whale_funded(buyer), buyer in db_wallets
-                if (is_sniper or is_whale) and not await store.has_open_signal(mint):
+                if is_sniper or is_whale:
                     await process_dex_signal(mint, buyer, is_whale, is_sniper)
+
         return JSONResponse({"status": "success"})
     except Exception as e:
         logger.error(f"Webhook Failure: {e}")
@@ -558,7 +596,7 @@ async def telegram_command_handler(request: Request):
         elif cmd == "/pair":
             if len(parts) > 1:
                 input_val = parts[1]
-                if "/" in input_val: # CEX Case
+                if "/" in input_val: 
                     pair = input_val.upper()
                     await exchange.load_markets()
                     if pair in exchange.markets:
@@ -569,22 +607,20 @@ async def telegram_command_handler(request: Request):
                         await send_direct_tg(f"✅ CEX Pair `{pair}` monitoring enabled.")
                     else:
                         await send_direct_tg(f"❌ `{pair}` not found on KuCoin.")
-                else: # DEX Case
+                else: 
                     await store.add_tracked_wallet(input_val, "Manual")
                     await send_direct_tg(f"✅ Wallet `{input_val[:6]}...` tracked.")
 
         elif cmd in ["/untrack", "/remove", "/delete"]:
             if len(parts) > 1:
                 target = parts[1]
-                if "/" in target: # CEX Pair removal
+                if "/" in target: 
                     target = target.upper()
                     if target in cfg.symbols:
                         cfg.symbols.remove(target)
                         await store.remove_cex_pair(target)
                         await send_direct_tg(f"❌ Removed CEX pair: `{target}`")
-                    else:
-                        await send_direct_tg(f"❓ `{target}` is not in the active monitoring list.")
-                else: # Wallet removal
+                else: 
                     await store.remove_tracked_wallet(target)
                     await send_direct_tg(f"❌ Stopped tracking wallet: `{target}`")
 
@@ -605,21 +641,40 @@ async def telegram_command_handler(request: Request):
 async def hunting_audit_loop():
     while True:
         try:
-            await asyncio.sleep(3600)
+            await asyncio.sleep(3600) 
             async with store.async_session() as session_db:
                 cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-                q = select(WalletCandidate).where(WalletCandidate.timestamp < cutoff)
+                q = select(WalletCandidate).where(WalletCandidate.timestamp >= cutoff).where(WalletCandidate.is_win == 0)
                 res = await session_db.execute(q)
                 candidates = res.scalars().all()
+                
                 for c in candidates:
                     try:
                         curr = await generator.dex.get_price_data(c.token_mint)
                         if curr['price'] >= (c.entry_price * cfg.min_hunter_profit_mult):
-                            await store.add_tracked_wallet(c.address, label=f"Hunted-{curr['symbol']}")
-                            await send_direct_tg(f"🧬 **INSIDER HUNTED**\nWallet `{c.address[:6]}` made 3x on `{curr['symbol']}`. Added.")
+                            c.is_win = 1 
+                            logger.info(f"Hunter: Candidate {c.address[:6]} hit profit target.")
                     except: continue
-                    await session_db.delete(c)
+
                 await session_db.commit()
+
+                consistency_query = (
+                    select(WalletCandidate.address, func.count(WalletCandidate.id))
+                    .where(WalletCandidate.is_win == 1)
+                    .group_by(WalletCandidate.address)
+                    .having(func.count(WalletCandidate.id) >= cfg.min_hunter_wins_required)
+                )
+                winners = await session_db.execute(consistency_query)
+                
+                for addr, win_count in winners.all():
+                    if addr not in store.wallet_cache:
+                        await store.add_tracked_wallet(addr, label=f"Expert-Hunter-{win_count}W")
+                        await send_direct_tg(f"🧬 **PRO-INSIDER HUNTED**\nWallet `{addr[:6]}` added.")
+                
+                cleanup_cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+                await session_db.execute(delete(WalletCandidate).where(WalletCandidate.timestamp < cleanup_cutoff))
+                await session_db.commit()
+
         except Exception as e: logger.error(f"Hunter Loop Error: {e}")
 
 async def centralized_dex_watcher():
@@ -677,4 +732,4 @@ async def health():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    uvicorn.run("signalbot:app", host="0.0.0.0", port=port, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
