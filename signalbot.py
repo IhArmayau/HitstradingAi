@@ -386,16 +386,19 @@ async def health():
 async def index(request: Request):
     try:
         signals_data = await store.get_latest_signals()
-        context = {
-            "signals": signals_data,
-            "bot_status": "ONLINE",
-            "version": cfg.model_version
-        }
-        # Fixed: Explicitly passing request object to resolve 500 Error
-        return templates.TemplateResponse("index.html", {"request": request, **context})
+        # FIXED: Pass a flat dictionary to avoid hashing conflict errors in Starlette/Jinja2
+        return templates.TemplateResponse(
+            "index.html", 
+            {
+                "request": request,
+                "signals": signals_data,
+                "bot_status": "ONLINE",
+                "version": cfg.model_version
+            }
+        )
     except Exception as e:
         logger.error(f"Template Render Error: {e}")
-        return HTMLResponse(content="Dashboard Rendering Error", status_code=500)
+        return HTMLResponse(content=f"Dashboard Rendering Error: {str(e)}", status_code=500)
 
 @app.post("/webhook")
 async def helius_webhook(request: Request):
