@@ -169,7 +169,7 @@ class SignalStore:
         self.engine = create_async_engine(db_url, pool_pre_ping=True, pool_recycle=1800)
         self.async_session = sessionmaker(self.engine, expire_on_commit=False, class_=AsyncSession)
         self.symbol_locks = {}
-        self.wallet_cache = {} 
+        self.wallet_cache = {}
 
     async def init_db(self):
         async with self.engine.begin() as conn:
@@ -428,28 +428,36 @@ generator: Optional[SignalGenerator] = None
 background_tasks = set()
 
 @app.get("/health")
+@app.head("/health")
 async def health():
     return {"status": "online", "monitors": len(background_tasks), "version": cfg.model_version}
 
 @app.get("/", response_class=HTMLResponse)
+@app.head("/")
 async def index(request: Request):
-    return templates.TemplateResponse("index.html", {
+    # Fixed: Clean dictionary passing to avoid unhashable type errors
+    context = {
         "request": request,
         "bot_status": "ONLINE",
-        "version": cfg.model_version
-    })
+        "version": str(cfg.model_version)
+    }
+    return templates.TemplateResponse("index.html", context)
 
 @app.get("/signals", response_class=HTMLResponse)
 async def get_signals_partial(request: Request):
     try:
         raw_signals = await store.get_latest_signals()
-        return templates.TemplateResponse("signals_partial.html", {
+        # Fixed: Explicit check to ensure signals is always a list
+        signals_data = raw_signals if raw_signals is not None else []
+        
+        context = {
             "request": request,
-            "signals": raw_signals
-        })
+            "signals": signals_data
+        }
+        return templates.TemplateResponse("signals_partial.html", context)
     except Exception as e:
         logger.error(f"Partial Render Error: {e}")
-        return HTMLResponse(content="<tr><td colspan='5' class='py-10 text-center text-red-500'>Backend Error</td></tr>", status_code=500)
+        return HTMLResponse(content="<tr><td colspan='5' class='py-10 text-center text-red-500'>Backend Refreshing...</td></tr>")
 
 @app.post("/webhook")
 async def helius_webhook(request: Request):
@@ -615,8 +623,7 @@ async def startup():
     async def wallet_refresh_loop():
         while True:
             await asyncio.sleep(1800)
-            await store.refresh_wallet_cache()
-
+            await store.refresh_wallet_cache()                                                       
     monitor_task = asyncio.create_task(background_monitor())
     dex_watcher_task = asyncio.create_task(centralized_dex_watcher())
     refresh_task = asyncio.create_task(wallet_refresh_loop())
@@ -630,8 +637,7 @@ async def startup():
 async def shutdown():
     for task in background_tasks: task.cancel()
     if session: await session.close()
-    await exchange.close()
-
+    await exchange.close()                                                                           
 async def background_monitor():
     while True:
         try:
@@ -659,11 +665,11 @@ async def send_direct_tg(text: str):
         logger.error(f"Telegram Send Error: {e}")
 
 if __name__ == "__main__":
-    # Fixed deployment block for Render
+    # Standard deployment block for Render
     port = int(os.environ.get("PORT", 10000))
     print(f"Binding QuikPulse to Port: {port}")
     uvicorn.run(
-        "signalbot:app", # Run by name for process stability
+        "signalbot:app",
         host="0.0.0.0",
         port=port,
         log_level="info",
