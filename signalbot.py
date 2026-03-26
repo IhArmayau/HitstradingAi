@@ -60,6 +60,10 @@ if DATABASE_URL:
         DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
     elif DATABASE_URL.startswith("postgresql://") and "+asyncpg" not in DATABASE_URL:
         DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+else:
+    # Fallback to prevent startup crash
+    DATABASE_URL = "sqlite+aiosqlite:///./test.db"
+    logger.warning("DATABASE_URL not found, falling back to local SQLite.")
 
 Base = declarative_base()
 
@@ -82,7 +86,7 @@ class SignalModel(Base):
     is_cluster = Column(Integer, default=0)
     status = Column(String, default='open')
     model_version = Column(String)
-    vol_liq_ratio = Column(Float, default=0.0)
+    vol_liq_ratio = Column(Float, default=0.0) 
     time_to_close = Column(Integer, nullable=True)
 
 class TrackedWallet(Base):
@@ -167,7 +171,11 @@ async def request_with_retry(session: aiohttp.ClientSession, method: str, url: s
 class SignalStore:
     def __init__(self, db_url: str):
         self.engine = create_async_engine(db_url, pool_pre_ping=True, pool_recycle=1800)
-        self.async_session = sessionmaker(self.engine, expire_on_commit=False, class_=AsyncSession)
+        self.async_session = sessionmaker(
+            self.engine, 
+            expire_on_commit=False, 
+            class_=AsyncSession
+        )
         self.symbol_locks = {}
         self.wallet_cache = {}
 
@@ -317,7 +325,7 @@ class SignalGenerator:
         self.dex, self.security = DexEngine(session), SecurityEngine(session)
         self.hunter = DiscoveryHunter(HELIUS_API_KEY, session, cfg)
         self.executor = TradeExecutor(cfg)
-        self.active_monitors_data: Dict[str, float] = {}
+        self.active_monitors_data: Dict[str, float] = {} 
         self.cooldown_cache = {}
         self.prev_oi = {}
         self.ml_model = self._load_model()
@@ -325,18 +333,17 @@ class SignalGenerator:
     def _load_model(self):
         path = self.cfg.ml_model_path
         try:
-            if os.path.exists(path) and os.path.isfile(path) and os.path.getsize(path) > 100:
-                if path.endswith('.h5') and HAS_TF:
-                    try:
+            if os.path.exists(path) and os.path.isfile(path):
+                if path.endswith('.h5'):
+                    if HAS_TF:
                         return load_keras_model(path)
-                    except Exception as tf_err:
-                        logger.warning(f"TF Load failed (mock or corrupt file): {tf_err}. Using Heuristic Mode.")
-                        return None
-                elif not path.endswith('.h5'):
+                    else:
+                        logger.error("TensorFlow not installed. Cannot load .h5 model.")
+                else:
                     with open(path, 'rb') as f:
                         return pickle.load(f)
             else:
-                logger.warning(f"Model file {path} missing, empty, or mock. Using Heuristic Mode.")
+                logger.warning(f"Model file not found at: {path}. Using heuristic confidence.")
         except Exception as e:
             logger.error(f"Error loading model at {path}: {e}")
         return None
@@ -345,7 +352,7 @@ class SignalGenerator:
         if self.ml_model:
             try:
                 if self.cfg.ml_model_path.endswith('.h5'):
-                    pred = self.ml_model.predict(np.array([features]), verbose=0)
+                    pred = self.ml_model.predict(np.array([features]))
                     return float(pred[0][0] * 100)
                 else:
                     return float(self.ml_model.predict_proba([features])[0][1] * 100)
@@ -375,7 +382,7 @@ class SignalGenerator:
     async def generate_cex_signal(self, symbol: str):
         if self.cooldown_cache.get(symbol) and (datetime.now() - self.cooldown_cache[symbol]) < timedelta(minutes=self.cfg.trade.signal_cooldown_minutes):
             return
-
+        
         async with self.store.get_symbol_lock(symbol):
             try:
                 btc_trend = await self.get_btc_trend_filter()
@@ -406,7 +413,7 @@ class SignalGenerator:
                         "confidence": self.predict_confidence([funding, social['score']]),
                         "sentiment_score": social['score'], "funding": funding, "open_interest": oi,
                         "model_version": self.cfg.model_version,
-                        "vol_liq_ratio": 0.0
+                        "vol_liq_ratio": 0.0 
                     }
                     await self.store.insert_signal(sig)
                     self.cooldown_cache[symbol] = datetime.now()
@@ -428,36 +435,28 @@ generator: Optional[SignalGenerator] = None
 background_tasks = set()
 
 @app.get("/health")
-@app.head("/health")
 async def health():
     return {"status": "online", "monitors": len(background_tasks), "version": cfg.model_version}
 
 @app.get("/", response_class=HTMLResponse)
-@app.head("/")
 async def index(request: Request):
-    # Fixed: Clean dictionary passing to avoid unhashable type errors
-    context = {
+    return templates.TemplateResponse("index.html", {
         "request": request,
         "bot_status": "ONLINE",
-        "version": str(cfg.model_version)
-    }
-    return templates.TemplateResponse("index.html", context)
+        "version": cfg.model_version
+    })
 
 @app.get("/signals", response_class=HTMLResponse)
 async def get_signals_partial(request: Request):
     try:
         raw_signals = await store.get_latest_signals()
-        # Fixed: Explicit check to ensure signals is always a list
-        signals_data = raw_signals if raw_signals is not None else []
-        
-        context = {
+        return templates.TemplateResponse("signals_partial.html", {
             "request": request,
-            "signals": signals_data
-        }
-        return templates.TemplateResponse("signals_partial.html", context)
+            "signals": raw_signals
+        })
     except Exception as e:
         logger.error(f"Partial Render Error: {e}")
-        return HTMLResponse(content="<tr><td colspan='5' class='py-10 text-center text-red-500'>Backend Refreshing...</td></tr>")
+        return HTMLResponse(content="<tr><td colspan='5' class='py-10 text-center text-red-500'>Backend Error</td></tr>", status_code=500)
 
 @app.post("/webhook")
 async def helius_webhook(request: Request):
@@ -465,14 +464,14 @@ async def helius_webhook(request: Request):
         body = await request.body()
         data = json.loads(body)
         logger.info(f"🔗 [WEBHOOK] Batch Received: {len(data)} events.")
-
+        
         db_wallets = store.wallet_cache
-
+        
         for event in data:
             if event.get("type") != "SWAP": continue
             swap = event.get("events", {}).get("swap", {})
             mint, buyer = swap.get("tokenOutMint"), event.get("feePayer")
-
+            
             is_whale = await generator.hunter.is_whale_funded(buyer)
             is_sniper = buyer in db_wallets
 
@@ -480,11 +479,11 @@ async def helius_webhook(request: Request):
                 logger.info(f"🎯 [MATCH] Sniper/Whale: {buyer} buying {mint}")
                 dex_data = await generator.dex.get_price_data(mint)
                 safety = await generator.security.get_safety_report(mint, dex_data['vol24'], dex_data['liq'])
-
+                
                 sig = {
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "symbol": dex_data['symbol'], "market_type": "DEX", "contract_address": mint,
-                    "signal": "BUY", "entry": dex_data['price'], "confidence": 95.0,
+                    "signal": "BUY", "entry": dex_data['price'], "confidence": 95.0, 
                     "model_version": cfg.model_version,
                     "vol_liq_ratio": safety['vl_ratio'],
                     "safety_score": safety['safety_score']
@@ -492,12 +491,12 @@ async def helius_webhook(request: Request):
                 await store.insert_signal(sig)
                 await generator.executor.execute_trade(sig)
                 await notify_new_signal(sig, session, cfg, is_whale=is_whale, is_sniper=is_sniper)
-
+                
                 if mint not in generator.active_monitors_data:
                     generator.active_monitors_data[mint] = float(dex_data['price'])
-
+                    
         return JSONResponse(content={"status": "success"}, status_code=200)
-    except Exception as e:
+    except Exception as e: 
         logger.error(f"❌ Webhook Processing Failure: {e}")
         return JSONResponse(content={"status": "error"}, status_code=500)
 
@@ -589,16 +588,16 @@ async def centralized_dex_watcher():
             for mint, entry in tokens_to_check:
                 data = await generator.dex.get_price_data(mint)
                 if data['price'] <= 0: continue
-
+                
                 if data['price'] >= entry * 1.5:
                     await send_direct_tg(f"💰 **DEX TP**\nToken: `{data['symbol']}`\nGain: `+50%`")
                     generator.active_monitors_data.pop(mint, None)
                 elif data['price'] <= entry * 0.8:
                     await send_direct_tg(f"⚠️ **DEX SL**\nToken: `{data['symbol']}`\nLoss: `-20%`")
                     generator.active_monitors_data.pop(mint, None)
-
+                
                 await asyncio.sleep(2)
-
+                
             await asyncio.sleep(60)
         except asyncio.CancelledError: break
         except Exception as e:
@@ -608,26 +607,30 @@ async def centralized_dex_watcher():
 @app.on_event("startup")
 async def startup():
     global session, generator
+    if not os.path.exists(cfg.ml_model_path) or not os.path.isfile(cfg.ml_model_path):
+         logger.warning(f"CRITICAL: ML model file {cfg.ml_model_path} missing.")
+         
     await store.init_db()
     session = aiohttp.ClientSession()
     sentinel = SocialSentinel(SANTIMENT_API_KEY, session)
     generator = SignalGenerator(cfg, store, exchange, sentinel, cluster_map, session)
-
+    
     public_url = os.getenv("RENDER_EXTERNAL_URL")
     if public_url and cfg.telegram_bot_token:
         webhook_url = f"{public_url}/tg-webhook"
         setup_url = f"https://api.telegram.org/bot{cfg.telegram_bot_token}/setWebhook?url={webhook_url}"
         async with session.get(setup_url) as resp:
             logger.info(f"Telegram Webhook Status: {await resp.json()}")
-
+    
     async def wallet_refresh_loop():
         while True:
             await asyncio.sleep(1800)
-            await store.refresh_wallet_cache()                                                       
+            await store.refresh_wallet_cache()
+            
     monitor_task = asyncio.create_task(background_monitor())
     dex_watcher_task = asyncio.create_task(centralized_dex_watcher())
     refresh_task = asyncio.create_task(wallet_refresh_loop())
-
+    
     background_tasks.add(monitor_task)
     background_tasks.add(dex_watcher_task)
     background_tasks.add(refresh_task)
@@ -637,7 +640,8 @@ async def startup():
 async def shutdown():
     for task in background_tasks: task.cancel()
     if session: await session.close()
-    await exchange.close()                                                                           
+    await exchange.close()
+
 async def background_monitor():
     while True:
         try:
@@ -665,13 +669,10 @@ async def send_direct_tg(text: str):
         logger.error(f"Telegram Send Error: {e}")
 
 if __name__ == "__main__":
-    # Standard deployment block for Render
-    port = int(os.environ.get("PORT", 10000))
-    print(f"Binding QuikPulse to Port: {port}")
     uvicorn.run(
-        "signalbot:app",
-        host="0.0.0.0",
-        port=port,
+        app, 
+        host="0.0.0.0", 
+        port=int(os.getenv("PORT", 8000)),
         log_level="info",
         access_log=True
     )
