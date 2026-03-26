@@ -422,6 +422,9 @@ class SignalGenerator:
         except: return 0.0, 0.0, False
 
     async def generate_cex_signal(self, symbol: str):
+        # NEW: Polling Heartbeat Log
+        logger.info(f"🔍 CEX Scan: Checking {symbol} for signal conditions...")
+        
         if self.cooldown_cache.get(symbol) and (datetime.now() - self.cooldown_cache[symbol]) < timedelta(minutes=self.cfg.trade.signal_cooldown_minutes):
             return
         async with self.store.get_symbol_lock(symbol):
@@ -754,6 +757,8 @@ async def centralized_dex_watcher():
 async def background_monitor():
     while True:
         try:
+            # NEW: Cycle Heartbeat Log
+            logger.info(f"🔄 Starting CEX Polling Cycle for {len(cfg.symbols)} pairs...")
             for s in list(cfg.symbols):
                 await generator.generate_cex_signal(s)
                 await asyncio.sleep(5)
@@ -792,11 +797,14 @@ async def send_direct_tg(text: str):
 
 @app.get("/health")
 async def health():
+    # NEW: Enhanced Health Payload for External Monitoring
     return {
         "status": "online",
-        "uptime": str(datetime.now(timezone.utc)),
+        "bot_version": cfg.model_version,
+        "uptime_snapshot": str(datetime.now(timezone.utc)),
         "cex_active": len(cfg.symbols),
-        "dex_active": len(generator.active_monitors_data)
+        "dex_active": len(generator.active_monitors_data),
+        "db_engine": "ready" if store.engine else "not_initialized"
     }
 
 if __name__ == "__main__":
