@@ -240,7 +240,7 @@ class DiscoveryHunter:
         try:
             data = await request_with_retry(self.session, "POST", url, json={"query": {"addresses": [wallet_address]}})
             for item in data.get("identities", []):
-                if any(ex.lower() in item.get("name", "").lower() for ex in self.known_exchanges): return True
+                if any(ex.lower() in item.get("name", "").lower() for x in self.known_exchanges): return True
         except: return False
         return False
 
@@ -631,7 +631,18 @@ async def background_monitor():
 async def notify_new_signal(sig, session, cfg, is_whale=False, is_sniper=False, is_squeeze=False):
     if not cfg.telegram_bot_token or not session: return
     prefix = "🚨 *SQUEEZE*" if is_squeeze else "🎯 *SNIPER*" if is_sniper else "🐋 *WHALE*" if is_whale else "🚀 *SIGNAL*"
-    msg = f"{prefix}\nPair: `{sig['symbol']}`\nAction: {sig['signal']}\nEntry: `${sig['entry']}`"
+    
+    msg = (f"{prefix}\n"
+           f"Pair: `{sig['symbol']}`\n"
+           f"Action: {sig['signal']}\n"
+           f"Entry: `${sig['entry']}`")
+    
+    # Append SL and TP if they exist in the signal dictionary
+    if sig.get("sl"):
+        msg += f"\nSL: `${sig['sl']}`"
+    if sig.get("tp"):
+        msg += f"\nTP: `${sig['tp']}`"
+        
     await send_direct_tg(msg)
 
 async def send_direct_tg(text: str):
