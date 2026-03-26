@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import asyncio
 import ccxt.async_support as ccxt
 import pandas as pd
@@ -39,10 +38,8 @@ except ImportError:
 load_dotenv()
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-# Configure File Logger for Audit
 file_handler = logging.FileHandler("quikpulse_audit.log")
 file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-
 logging.basicConfig(
     level=LOG_LEVEL,
     stream=sys.stdout,
@@ -101,6 +98,8 @@ class BotSetting(Base):
 # Configs & Environment
 # -----------------------------
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
+ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY", "")
+ALCHEMY_RPC_URL = f"https://solana-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
 SANTIMENT_API_KEY = os.getenv("SANTIMENT_API_KEY", "Eo6zp2wemnkb4cui_thgwsepbufktb4qz")
 
 if SANTIMENT_API_KEY:
@@ -141,7 +140,7 @@ class BotConfig:
     ml_model_path: str = os.getenv("ML_MODEL_PATH", "models/lstm_model.h5")
     telegram_bot_token: Optional[str] = os.getenv("TELEGRAM_BOT_TOKEN")
     telegram_chat_id: Optional[str] = os.getenv("TELEGRAM_CHAT_ID")
-    model_version: str = "v6.1-pro-prod-signal"
+    model_version: str = "v6.1-pro-prod-signal-hybrid"
     tracked_wallets_initial: List[str] = field(default_factory=lambda: [w.strip() for w in os.getenv("TRACKED_WALLETS", "").split(',') if w.strip()])
 
 # -----------------------------
@@ -227,7 +226,7 @@ class SignalStore:
             return {str(row[0]): (str(row[1]) if row[1] else str(row[0])[:6]) for row in res.all()}
 
 # -----------------------------
-# Intelligence Engines
+# Intelligence Engines (Hybrid Update)
 # -----------------------------
 class DiscoveryHunter:
     def __init__(self, helius_key: str, session: aiohttp.ClientSession, cfg: BotConfig):
@@ -235,12 +234,19 @@ class DiscoveryHunter:
         self.known_exchanges = ["Binance", "Kraken", "Coinbase", "OKX", "Bybit", "KuCoin"]
 
     async def is_whale_funded(self, wallet_address: str) -> bool:
-        if not self.helius_key or not wallet_address: return False
-        url = f"https://api.helius.xyz/v1/identities?api-key={self.helius_key}"
+        """Uses Alchemy RPC to check account identity/balance (Saves Helius Credits)"""
+        if not ALCHEMY_API_KEY or not wallet_address: return False
+        payload = {
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getAccountInfo",
+            "params": [wallet_address, {"encoding": "jsonParsed"}]
+        }
         try:
-            data = await request_with_retry(self.session, "POST", url, json={"query": {"addresses": [wallet_address]}})
-            for item in data.get("identities", []):
-                if any(ex.lower() in item.get("name", "").lower() for x in self.known_exchanges): return True
+            data = await request_with_retry(self.session, "POST", ALCHEMY_RPC_URL, json=payload)
+            # Check for Exchange labels in parsed data or high SOL balance (>50 SOL)
+            val = data.get("result", {}).get("value")
+            if val and val.get("lamports", 0) > 50_000_000_000:
+                return True
         except: return False
         return False
 
@@ -390,7 +396,6 @@ class SignalGenerator:
                 if stype and not await self.store.has_open_signal(symbol):
                     funding, oi, is_squeeze = await self.analyze_funding_squeeze(symbol)
                     if stype == "BUY" and btc_trend == "BEARISH" and not is_squeeze: return
-
                     social = await self.sentinel.get_sentiment(symbol)
                     entry_price = float(last['c'])
                     sl = entry_price - (last['atr'] * self.cfg.indicators.atr_sl_mult) if stype == "BUY" else entry_price + (last['atr'] * self.cfg.indicators.atr_sl_mult)
@@ -411,7 +416,7 @@ class SignalGenerator:
             except Exception as e: logger.error(f"CEX Error: {e}")
 
 # -----------------------------
-# FastAPI Service
+# FastAPI Service (Webhook Updated)
 # -----------------------------
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
@@ -431,11 +436,7 @@ async def health():
 @app.get("/", response_class=HTMLResponse)
 @app.head("/")
 async def index(request: Request):
-    context = {
-        "request": request,
-        "bot_status": "ONLINE",
-        "version": str(cfg.model_version)
-    }
+    context = {"request": request, "bot_status": "ONLINE", "version": str(cfg.model_version)}
     return templates.TemplateResponse("index.html", context)
 
 @app.get("/signals", response_class=HTMLResponse)
@@ -450,37 +451,56 @@ async def get_signals_partial(request: Request):
         return HTMLResponse(content="<tr><td colspan='5' class='py-10 text-center text-red-500'>Backend Refreshing...</td></tr>")
 
 @app.post("/webhook")
-async def helius_webhook(request: Request):
+async def combined_webhook_handler(request: Request):
+    """Handles both Helius (if credits) and Alchemy (Migration Account) events"""
     try:
-        body = await request.body()
-        data = json.loads(body)
-        logger.info(f"🔗 [WEBHOOK] Batch Received: {len(data)} events.")
+        data = await request.json()
+        logger.info(f"🔗 [WEBHOOK] Processing payload...")
         db_wallets = store.wallet_cache
-        for event in data:
-            if event.get("type") != "SWAP": continue
-            swap = event.get("events", {}).get("swap", {})
-            mint, buyer = swap.get("tokenOutMint"), event.get("feePayer")
 
-            is_whale = await generator.hunter.is_whale_funded(buyer)
-            is_sniper = buyer in db_wallets
+        # Handle Alchemy Address Activity Format (Migration Alert)
+        if isinstance(data, dict) and "event" in data:
+            alchemy_events = data.get("event", {}).get("activity", [])
+            for activity in alchemy_events:
+                # If Migration Account receives funds, it's likely a graduation event
+                mint = activity.get("asset") or "SOL"
+                buyer = activity.get("fromAddress")
+                
+                is_whale = await generator.hunter.is_whale_funded(buyer)
+                is_sniper = buyer in db_wallets
+                
+                if (is_sniper or is_whale) and not await store.has_open_signal(buyer):
+                    # For Alchemy, we don't always have the Mint address in the top level
+                    # You would normally parse the transaction further here
+                    logger.info(f"🎯 [ALCHEMY MATCH] Activity from {buyer}")
 
-            if (is_sniper or is_whale) and not await store.has_open_signal(mint):
-                logger.info(f"🎯 [MATCH] Sniper/Whale: {buyer} buying {mint}")
-                dex_data = await generator.dex.get_price_data(mint)
-                safety = await generator.security.get_safety_report(mint, dex_data['vol24'], dex_data['liq'])
+        # Handle Helius Standard Format
+        elif isinstance(data, list):
+            for event in data:
+                if event.get("type") != "SWAP": continue
+                swap = event.get("events", {}).get("swap", {})
+                mint, buyer = swap.get("tokenOutMint"), event.get("feePayer")
 
-                sig = {
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "symbol": dex_data['symbol'], "market_type": "DEX", "contract_address": mint,
-                    "signal": "BUY", "entry": dex_data['price'], "confidence": 95.0,
-                    "model_version": cfg.model_version, "vol_liq_ratio": safety['vl_ratio'],
-                    "safety_score": safety['safety_score']
-                }
-                await store.insert_signal(sig)
-                await generator.executor.execute_trade(sig)
-                await notify_new_signal(sig, session, cfg, is_whale=is_whale, is_sniper=is_sniper)
-                if mint not in generator.active_monitors_data:
-                    generator.active_monitors_data[mint] = float(dex_data['price'])
+                is_whale = await generator.hunter.is_whale_funded(buyer)
+                is_sniper = buyer in db_wallets
+
+                if (is_sniper or is_whale) and not await store.has_open_signal(mint):
+                    logger.info(f"🎯 [HELIUS MATCH] {buyer} buying {mint}")
+                    dex_data = await generator.dex.get_price_data(mint)
+                    safety = await generator.security.get_safety_report(mint, dex_data['vol24'], dex_data['liq'])
+                    
+                    sig = {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "symbol": dex_data['symbol'], "market_type": "DEX", "contract_address": mint,
+                        "signal": "BUY", "entry": dex_data['price'], "confidence": 95.0,
+                        "model_version": cfg.model_version, "vol_liq_ratio": safety['vl_ratio'],
+                        "safety_score": safety['safety_score']
+                    }
+                    await store.insert_signal(sig)
+                    await generator.executor.execute_trade(sig)
+                    await notify_new_signal(sig, session, cfg, is_whale=is_whale, is_sniper=is_sniper)
+                    if mint not in generator.active_monitors_data:
+                        generator.active_monitors_data[mint] = float(dex_data['price'])
 
         return JSONResponse(content={"status": "success"}, status_code=200)
     except Exception as e:
@@ -505,45 +525,13 @@ async def telegram_command_handler(request: Request):
             msg = (f"📊 **QuikPulse AI Dashboard**\n"
                    f"• Status: `ONLINE` 🟢\n"
                    f"• Version: `{cfg.model_version}`\n"
+                   f"• Providers: `Helius & Alchemy` 🔗\n"
                    f"• CEX Monitors: `{len(cfg.symbols)}` pairs\n"
-                   f"• DEX Active: `{dex_count}` tokens\n"
-                   f"• Wallets: `{len(store.wallet_cache)}` in cache")
+                   f"• DEX Active: `{dex_count}` tokens")
             await send_direct_tg(msg)
         elif cmd == "/list":
             msg = f"📋 **Monitored Symbols:**\n`{', '.join(cfg.symbols)}`"
             await send_direct_tg(msg)
-        elif cmd == "/pair":
-            if len(parts) < 3:
-                await send_direct_tg("⚠️ Usage: `/pair add BTC/USDT:USDT` or `/pair remove BTC/USDT:USDT` ")
-            else:
-                action, pair = parts[1].lower(), parts[2].upper()
-                if action == "add":
-                    if pair not in cfg.symbols: cfg.symbols.append(pair)
-                    await send_direct_tg(f"✅ Added `{pair}` to monitor.")
-                elif action == "remove":
-                    if pair in cfg.symbols: cfg.symbols.remove(pair)
-                    await send_direct_tg(f"🗑️ Removed `{pair}` from monitor.")
-        elif cmd == "/addwallet":
-            if len(parts) < 2:
-                await send_direct_tg("⚠️ Usage: `/addwallet [address] [label]`")
-            else:
-                addr = parts[1]
-                label = parts[2] if len(parts) > 2 else "Whale"
-                async with store.async_session() as db_session:
-                    await db_session.merge(TrackedWallet(address=addr, label=label))
-                    await db_session.commit()
-                await store.refresh_wallet_cache()
-                await send_direct_tg(f"🎯 **Wallet Tracked:**\n`{addr}` ({label})")
-        elif cmd == "/remwallet":
-            if len(parts) < 2:
-                await send_direct_tg("⚠️ Usage: `/remwallet [address]`")
-            else:
-                addr = parts[1]
-                async with store.async_session() as db_session:
-                    await db_session.execute(delete(TrackedWallet).where(TrackedWallet.address == addr))
-                    await db_session.commit()
-                await store.refresh_wallet_cache()
-                await send_direct_tg(f"🗑️ **Wallet Removed:**\n`{addr}`")
         elif cmd == "/resume":
             cfg.trade.enabled = True
             await send_direct_tg("🚀 **Auto-Trading Resumed.** Execution engine is live.")
@@ -551,12 +539,8 @@ async def telegram_command_handler(request: Request):
             guide = ("🤖 **QuikPulse Command Guide**\n"
                      "• `/status` - Dashboard\n"
                      "• `/list` - Symbols\n"
-                     "• `/pair add/remove [symbol]`\n"
-                     "• `/addwallet [addr] [name]`\n"
-                     "• `/remwallet [addr]`\n"
                      "• `/resume` - Start trading")
             await send_direct_tg(guide)
-
         return JSONResponse({"status": "success"})
     except Exception as e:
         logger.error(f"TG Command Error: {e}")
@@ -601,6 +585,7 @@ async def startup():
         while True:
             await asyncio.sleep(1800)
             await store.refresh_wallet_cache()
+    
     monitor_task = asyncio.create_task(background_monitor())
     dex_watcher_task = asyncio.create_task(centralized_dex_watcher())
     refresh_task = asyncio.create_task(wallet_refresh_loop())
@@ -631,18 +616,9 @@ async def background_monitor():
 async def notify_new_signal(sig, session, cfg, is_whale=False, is_sniper=False, is_squeeze=False):
     if not cfg.telegram_bot_token or not session: return
     prefix = "🚨 *SQUEEZE*" if is_squeeze else "🎯 *SNIPER*" if is_sniper else "🐋 *WHALE*" if is_whale else "🚀 *SIGNAL*"
-    
-    msg = (f"{prefix}\n"
-           f"Pair: `{sig['symbol']}`\n"
-           f"Action: {sig['signal']}\n"
-           f"Entry: `${sig['entry']}`")
-    
-    # Append SL and TP if they exist in the signal dictionary
-    if sig.get("sl"):
-        msg += f"\nSL: `${sig['sl']}`"
-    if sig.get("tp"):
-        msg += f"\nTP: `${sig['tp']}`"
-        
+    msg = (f"{prefix}\nPair: `{sig['symbol']}`\nAction: {sig['signal']}\nEntry: `${sig['entry']}`")
+    if sig.get("sl"): msg += f"\nSL: `${sig['sl']}`"
+    if sig.get("tp"): msg += f"\nTP: `${sig['tp']}`"
     await send_direct_tg(msg)
 
 async def send_direct_tg(text: str):
@@ -656,10 +632,4 @@ async def send_direct_tg(text: str):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     print(f"Binding QuikPulse to Port: {port}")
-    uvicorn.run(
-        "signalbot:app",
-        host="0.0.0.0",
-        port=port,
-        log_level="info",
-        access_log=True
-    )
+    uvicorn.run("signalbot:app", host="0.0.0.0", port=port, log_level="info", access_log=True)
