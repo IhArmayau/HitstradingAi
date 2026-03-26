@@ -27,10 +27,14 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import Column, Integer, String, Float, Text, select, delete
 
 # -----------------------------
-# Logging Configuration (Optimized for Render/Stdout)
+# Logging Configuration
 # -----------------------------
 load_dotenv()
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# Configure File Logger for Audit
+file_handler = logging.FileHandler("quikpulse_audit.log")
+file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -38,6 +42,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger("QuikPulseAI")
+logger.addHandler(file_handler)
 
 # -----------------------------
 # Database Setup
@@ -130,7 +135,7 @@ class BotConfig:
     telegram_bot_token: Optional[str] = os.getenv("TELEGRAM_BOT_TOKEN")
     telegram_chat_id: Optional[str] = os.getenv("TELEGRAM_CHAT_ID")
     model_version: str = "v6.1-pro-prod-signal"
-    tracked_wallets: List[str] = field(default_factory=lambda: [w.strip() for w in os.getenv("TRACKED_WALLETS", "").split(',') if w.strip()])
+    tracked_wallets_initial: List[str] = field(default_factory=lambda: [w.strip() for w in os.getenv("TRACKED_WALLETS", "").split(',') if w.strip()])
 
 # -----------------------------
 # Production Utility: API Resilience
@@ -154,15 +159,19 @@ async def request_with_retry(session: aiohttp.ClientSession, method: str, url: s
 # -----------------------------
 class SignalStore:
     def __init__(self, db_url: str):
-        # FIX: Removed pool_size/max_overflow which can cause issues with some asyncpg drivers on cloud hosts
         self.engine = create_async_engine(db_url, pool_pre_ping=True, pool_recycle=1800)
         self.async_session = sessionmaker(self.engine, expire_on_commit=False, class_=AsyncSession)
         self.symbol_locks = {}
+        self.wallet_cache = {} # In-memory cache for high-performance webhook lookups
 
     async def init_db(self):
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-        logger.info("Database Schema Synchronized.")
+        await self.refresh_wallet_cache()
+        logger.info("Database Schema Synchronized & Wallet Cache Hydrated.")
+
+    async def refresh_wallet_cache(self):
+        self.wallet_cache = await self.get_all_tracked_wallets_detailed()
 
     async def save_setting(self, key: str, value: Any):
         async with self.async_session() as session:
@@ -174,6 +183,7 @@ class SignalStore:
             new_sig = SignalModel(**s)
             session.add(new_sig)
             await session.commit()
+            logger.info(f"AUDIT: Signal Stored: {s['symbol']} - {s['signal']}")
 
     async def get_latest_signals(self, limit: int = 25):
         async with self.async_session() as session:
@@ -223,7 +233,7 @@ class DiscoveryHunter:
         try:
             data = await request_with_retry(self.session, "POST", url, json={"query": {"addresses": [wallet_address]}})
             for item in data.get("identities", []):
-                if any(ex.lower() in item.get("name", "").lower() for ex in self.known_exchanges): return True
+                if any(ex.lower() in item.get("name", "").lower() for x in self.known_exchanges): return True
         except: return False
         return False
 
@@ -245,21 +255,24 @@ class DexEngine:
         self.session = session
 
     async def get_price_data(self, address: str) -> Dict[str, Any]:
-        try:
-            url = f"https://api.dexscreener.com/latest/dex/tokens/{address}"
-            async with self.session.get(url, timeout=10) as resp:
-                data = await resp.json()
-                pairs = data.get('pairs', [])
-                if pairs:
-                    p = pairs[0]
-                    return {
-                        "price": float(p.get('priceUsd', 0)),
-                        "symbol": p.get('baseToken', {}).get('symbol', 'UNK'),
-                        "vol24": float(p.get('volume', {}).get('h24', 0)),
-                        "liq": float(p.get('liquidity', {}).get('usd', 0))
-                    }
-        except Exception as e:
-            logger.error(f"DexEngine Fetch Error: {e}")
+        for attempt in range(3):
+            try:
+                url = f"https://api.dexscreener.com/latest/dex/tokens/{address}"
+                async with self.session.get(url, timeout=10) as resp:
+                    if resp.status != 200: continue
+                    data = await resp.json()
+                    pairs = data.get('pairs', [])
+                    if pairs:
+                        p = pairs[0]
+                        return {
+                            "price": float(p.get('priceUsd', 0)),
+                            "symbol": p.get('baseToken', {}).get('symbol', 'UNK'),
+                            "vol24": float(p.get('volume', {}).get('h24', 0)),
+                            "liq": float(p.get('liquidity', {}).get('usd', 0))
+                        }
+            except Exception as e:
+                if attempt == 2: logger.error(f"DexEngine Fatal Error for {address}: {e}")
+                await asyncio.sleep(1)
         return {"price": 0, "symbol": "UNK", "vol24": 0, "liq": 0}
 
 class ClusterEngine:
@@ -306,8 +319,6 @@ class SignalGenerator:
         try:
             if os.path.exists(self.cfg.ml_model_path):
                 with open(self.cfg.ml_model_path, 'rb') as f: return pickle.load(f)
-            else:
-                logger.warning(f"ML Model file missing at {self.cfg.ml_model_path}. Defaulting to heuristic confidence.")
         except Exception as e:
             logger.error(f"Error loading ML model: {e}")
         return None
@@ -420,24 +431,22 @@ async def get_signals_partial(request: Request):
 @app.post("/webhook")
 async def helius_webhook(request: Request):
     try:
-        # PRODUCTION FIX: Full request visibility
         body = await request.body()
         data = json.loads(body)
-        logger.info(f"🔗 [WEBHOOK] Incoming Hit: {len(data)} events detected.")
+        logger.info(f"🔗 [WEBHOOK] Batch Received: {len(data)} events.")
         
-        db_wallets = await store.get_all_tracked_wallets_detailed()
+        db_wallets = store.wallet_cache
+        
         for event in data:
             if event.get("type") != "SWAP": continue
             swap = event.get("events", {}).get("swap", {})
             mint, buyer = swap.get("tokenOutMint"), event.get("feePayer")
             
-            logger.info(f"🔍 [SCAN] Processing swap: {mint} | Wallet: {buyer}")
-            
             is_whale = await generator.hunter.is_whale_funded(buyer)
             is_sniper = buyer in db_wallets
 
             if (is_sniper or is_whale) and not await store.has_open_signal(mint):
-                logger.info(f"🎯 [TARGET] Valid Signal for {mint} (Whale={is_whale}, Sniper={is_sniper})")
+                logger.info(f"🎯 [MATCH] Sniper/Whale: {buyer} buying {mint}")
                 dex_data = await generator.dex.get_price_data(mint)
                 safety = await generator.security.get_safety_report(mint, dex_data['vol24'], dex_data['liq'])
                 
@@ -458,8 +467,96 @@ async def helius_webhook(request: Request):
                     
         return JSONResponse(content={"status": "success"}, status_code=200)
     except Exception as e: 
-        logger.error(f"❌ [WEBHOOK ERROR] {e}")
-        return JSONResponse(content={"status": "error", "message": str(e)}, status_code=500)
+        logger.error(f"❌ Webhook Processing Failure: {e}")
+        return JSONResponse(content={"status": "error"}, status_code=500)
+
+@app.post("/tg-webhook")
+async def telegram_command_handler(request: Request):
+    """Processes interactive commands from Telegram via Webhook"""
+    try:
+        data = await request.json()
+        if "message" not in data or "text" not in data["message"]:
+            return JSONResponse({"status": "ignored"})
+
+        message = data["message"]
+        text = message.get("text", "").strip()
+        parts = text.split()
+        cmd = parts[0].lower()
+
+        # 1. /status - View dashboard & settings
+        if cmd == "/status":
+            dex_count = len(generator.active_monitors_data)
+            msg = (f"📊 **QuikPulse AI Dashboard**\n"
+                   f"• Status: `ONLINE` 🟢\n"
+                   f"• Version: `{cfg.model_version}`\n"
+                   f"• CEX Monitors: `{len(cfg.symbols)}` pairs\n"
+                   f"• DEX Active: `{dex_count}` tokens\n"
+                   f"• Wallets: `{len(store.wallet_cache)}` in cache")
+            await send_direct_tg(msg)
+
+        # 2. /list - Show monitored symbols
+        elif cmd == "/list":
+            msg = f"📋 **Monitored Symbols:**\n`{', '.join(cfg.symbols)}`"
+            await send_direct_tg(msg)
+
+        # 3. /pair - Add or remove pairs
+        elif cmd == "/pair":
+            if len(parts) < 3:
+                await send_direct_tg("⚠️ Usage: `/pair add BTC/USDT:USDT` or `/pair remove BTC/USDT:USDT` ")
+            else:
+                action, pair = parts[1].lower(), parts[2].upper()
+                if action == "add":
+                    if pair not in cfg.symbols: cfg.symbols.append(pair)
+                    await send_direct_tg(f"✅ Added `{pair}` to monitor.")
+                elif action == "remove":
+                    if pair in cfg.symbols: cfg.symbols.remove(pair)
+                    await send_direct_tg(f"🗑️ Removed `{pair}` from monitor.")
+
+        # 4. /addwallet - Track a new wallet address
+        elif cmd == "/addwallet":
+            if len(parts) < 2:
+                await send_direct_tg("⚠️ Usage: `/addwallet [address] [label]`")
+            else:
+                addr = parts[1]
+                label = parts[2] if len(parts) > 2 else "Whale"
+                async with store.async_session() as db_session:
+                    await db_session.merge(TrackedWallet(address=addr, label=label))
+                    await db_session.commit()
+                await store.refresh_wallet_cache()
+                await send_direct_tg(f"🎯 **Wallet Tracked:**\n`{addr}` ({label})")
+
+        # 5. /remwallet - Remove a wallet address
+        elif cmd == "/remwallet":
+            if len(parts) < 2:
+                await send_direct_tg("⚠️ Usage: `/remwallet [address]`")
+            else:
+                addr = parts[1]
+                async with store.async_session() as db_session:
+                    await db_session.execute(delete(TrackedWallet).where(TrackedWallet.address == addr))
+                    await db_session.commit()
+                await store.refresh_wallet_cache()
+                await send_direct_tg(f"🗑️ **Wallet Removed:**\n`{addr}`")
+
+        # 6. /resume - Start auto-trading
+        elif cmd == "/resume":
+            cfg.trade.enabled = True
+            await send_direct_tg("🚀 **Auto-Trading Resumed.** Execution engine is live.")
+
+        # 7. /help - Show instruction guide
+        elif cmd == "/help":
+            guide = ("🤖 **QuikPulse Command Guide**\n"
+                     "• `/status` - Dashboard\n"
+                     "• `/list` - Symbols\n"
+                     "• `/pair add/remove [symbol]`\n"
+                     "• `/addwallet [addr] [name]`\n"
+                     "• `/remwallet [addr]`\n"
+                     "• `/resume` - Start trading")
+            await send_direct_tg(guide)
+
+        return JSONResponse({"status": "success"})
+    except Exception as e:
+        logger.error(f"TG Command Error: {e}")
+        return JSONResponse({"status": "error"}, status_code=500)
 
 async def centralized_dex_watcher():
     while True:
@@ -487,17 +584,35 @@ async def centralized_dex_watcher():
 @app.on_event("startup")
 async def startup():
     global session, generator
+    if not os.path.exists(cfg.ml_model_path):
+         logger.warning(f"CRITICAL: ML model path {cfg.ml_model_path} missing.")
+         
     await store.init_db()
     session = aiohttp.ClientSession()
     sentinel = SocialSentinel(SANTIMENT_API_KEY, session)
     generator = SignalGenerator(cfg, store, exchange, sentinel, cluster_map, session)
     
+    # Register Telegram Webhook automatically on Render
+    public_url = os.getenv("RENDER_EXTERNAL_URL")
+    if public_url and cfg.telegram_bot_token:
+        webhook_url = f"{public_url}/tg-webhook"
+        setup_url = f"https://api.telegram.org/bot{cfg.telegram_bot_token}/setWebhook?url={webhook_url}"
+        async with session.get(setup_url) as resp:
+            logger.info(f"Telegram Webhook Status: {await resp.json()}")
+    
+    async def wallet_refresh_loop():
+        while True:
+            await asyncio.sleep(1800)
+            await store.refresh_wallet_cache()
+            
     monitor_task = asyncio.create_task(background_monitor())
     dex_watcher_task = asyncio.create_task(centralized_dex_watcher())
+    refresh_task = asyncio.create_task(wallet_refresh_loop())
     
     background_tasks.add(monitor_task)
     background_tasks.add(dex_watcher_task)
-    logger.info(f"✅ QuikPulse AI {cfg.model_version} Startup Complete.")
+    background_tasks.add(refresh_task)
+    logger.info(f"🚀 QuikPulse {cfg.model_version} Fully Operational.")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -514,7 +629,7 @@ async def background_monitor():
             await asyncio.sleep(cfg.poll_interval)
         except asyncio.CancelledError: break
         except Exception as e:
-            logger.error(f"Monitor Error: {e}")
+            logger.error(f"Monitor Loop Error: {e}")
             await asyncio.sleep(60)
 
 async def notify_new_signal(sig, session, cfg, is_whale=False, is_sniper=False, is_squeeze=False):
@@ -529,10 +644,9 @@ async def send_direct_tg(text: str):
         url = f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage"
         await request_with_retry(session, "POST", url, json={"chat_id": cfg.telegram_chat_id, "text": text, "parse_mode": "Markdown"})
     except Exception as e:
-        logger.error(f"Telegram notification failed: {e}")
+        logger.error(f"Telegram Send Error: {e}")
 
 if __name__ == "__main__":
-    # PRODUCTION FIX: Log Level to INFO for Render visibility
     uvicorn.run(
         app, 
         host="0.0.0.0", 
