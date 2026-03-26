@@ -80,6 +80,7 @@ class SignalModel(Base):
     model_version = Column(String)
     vol_liq_ratio = Column(Float, default=0.0)
     time_to_close = Column(Integer, nullable=True)
+    priority = Column(Integer, default=0) # 0: Normal, 1: Whale/Sniper, 2: Expert Hunter
 
 class TrackedWallet(Base):
     __tablename__ = "tracked_wallets"
@@ -356,7 +357,13 @@ class TradeExecutor:
         if not self.cfg.trade.enabled:
             logger.info(f"🚫 [READ-ONLY] {sig['symbol']} Signal Detected.")
             return
-        logger.info(f"📣 [EXECUTION] {sig['market_type']} | {sig['symbol']} | {sig['signal']} @ {sig['entry']}")
+        
+        # Priority Multiplier for Position Size
+        pos_size = self.cfg.trade.max_position_size_usd
+        if sig.get('priority') == 2:
+            pos_size = pos_size * 1.5 # 50% larger for Expert Hunters
+            
+        logger.info(f"📣 [EXECUTION] {sig['market_type']} | {sig['symbol']} | {sig['signal']} @ {sig['entry']} | Size: ${pos_size}")
 
 class SignalGenerator:
     def __init__(self, cfg: BotConfig, store: SignalStore, ex: ccxt.Exchange, sentinel: SocialSentinel, cluster: ClusterEngine, session: aiohttp.ClientSession):
@@ -442,7 +449,7 @@ class SignalGenerator:
                         "market_type": "CEX", "entry": entry_price, "sl": round(sl, 6), "tp": round(tp, 6),
                         "confidence": self.predict_confidence([funding, social['score']]),
                         "sentiment_score": social['score'], "funding": funding, "open_interest": oi,
-                        "model_version": self.cfg.model_version, "vol_liq_ratio": 0.0
+                        "model_version": self.cfg.model_version, "vol_liq_ratio": 0.0, "priority": 0
                     }
                     await self.store.insert_signal(sig)
                     self.cooldown_cache[symbol] = datetime.now()
@@ -535,18 +542,30 @@ async def combined_webhook_handler(request: Request):
         return JSONResponse({"status": "error"}, status_code=500)
 
 async def process_dex_signal(mint: str, buyer: str, is_whale: bool, is_sniper: bool):
+    # Determine Priority Level
+    priority_level = 0
+    buyer_label = store.wallet_cache.get(buyer, "")
+    
+    if "Expert-Hunter" in buyer_label:
+        priority_level = 2
+    elif is_sniper or is_whale:
+        priority_level = 1
+
     dex_data = await generator.dex.get_price_data(mint)
     if dex_data['price'] <= 0: return
     safety = await generator.security.get_safety_report(mint, dex_data['vol24'], dex_data['liq'])
+    
     sig = {
         "timestamp": datetime.now(timezone.utc).isoformat(), "symbol": dex_data['symbol'],
         "market_type": "DEX", "contract_address": mint, "signal": "BUY", "entry": dex_data['price'],
-        "confidence": 95.0, "model_version": cfg.model_version, "vol_liq_ratio": safety['vl_ratio'],
-        "safety_score": safety['safety_score']
+        "confidence": 98.0 if priority_level == 2 else 95.0, 
+        "model_version": cfg.model_version, "vol_liq_ratio": safety['vl_ratio'],
+        "safety_score": safety['safety_score'], "priority": priority_level
     }
+    
     await store.insert_signal(sig)
     await generator.executor.execute_trade(sig)
-    await notify_new_signal(sig, session, cfg, is_whale=is_whale, is_sniper=is_sniper)
+    await notify_new_signal(sig, session, cfg, is_whale=is_whale, is_sniper=is_sniper, priority=priority_level)
     generator.active_monitors_data[mint] = float(dex_data['price'])
 
 @app.post("/tg-webhook")
@@ -575,11 +594,50 @@ async def telegram_command_handler(request: Request):
         elif cmd == "/list":
             wallets = store.wallet_cache
             if not wallets:
-                await send_direct_tg("📭 No insiders or wallets currently tracked.")
+                await send_direct_tg("📭 No insiders currently tracked.")
             else:
-                msg = "🎯 **Currently Tracked Insiders**\n\n"
+                msg = "🎯 **Tracked Insiders**\n\n"
                 for i, (addr, label) in enumerate(wallets.items(), 1):
                     msg += f"{i}. `{addr}`\n   └ Label: *{label}*\n"
+                await send_direct_tg(msg)
+
+        elif cmd == "/hunt":
+            async with store.async_session() as session_db:
+                total_c = await session_db.execute(select(func.count(WalletCandidate.id)))
+                wins = await session_db.execute(select(func.count(WalletCandidate.id)).where(WalletCandidate.is_win == 1))
+                
+                # ROI Performance Leaderboard (Top 3)
+                cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+                stmt = select(WalletCandidate).where(WalletCandidate.timestamp >= cutoff).limit(20)
+                res = await session_db.execute(stmt)
+                candidates = res.scalars().all()
+                
+                leaderboard = []
+                for c in candidates:
+                    curr = await generator.dex.get_price_data(c.token_mint)
+                    if curr['price'] > 0 and c.entry_price > 0:
+                        roi = ((curr['price'] - c.entry_price) / c.entry_price) * 100
+                        leaderboard.append((c.address, roi, curr['symbol']))
+                
+                leaderboard.sort(key=lambda x: x[1], reverse=True)
+                top_3 = leaderboard[:3]
+
+                msg = (
+                    f"🧬 **Hunter Audit Status**\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"🕵️ Candidates: `{total_c.scalar()}`\n"
+                    f"🏆 Confirmed Wins: `{wins.scalar()}`\n\n"
+                    f"🔥 **Top 24h Performers:**\n"
+                )
+                
+                if not top_3:
+                    msg += "_No active performers found._"
+                else:
+                    for i, (addr, roi, sym) in enumerate(top_3, 1):
+                        msg += f"{i}. `{addr[:6]}...` | *{sym}* | **+{roi:.1f}%**\n"
+                
+                msg += f"\n━━━━━━━━━━━━━━━\n"
+                msg += f"⏱️ Window: `24h` | Mult: `{cfg.min_hunter_profit_mult}x`"
                 await send_direct_tg(msg)
 
         elif cmd == "/pair":
@@ -595,6 +653,13 @@ async def telegram_command_handler(request: Request):
                 else:
                     await send_direct_tg(f"❌ `{pair}` not found.")
 
+        elif cmd == "/rempair":
+            if len(parts) > 1:
+                pair = parts[1].upper()
+                await store.remove_cex_pair(pair)
+                if pair in cfg.symbols: cfg.symbols.remove(pair)
+                await send_direct_tg(f"❌ Stopped monitoring CEX: `{pair}`")
+
         elif cmd == "/addwallet":
             if len(parts) > 1:
                 await store.add_tracked_wallet(parts[1], "Manual")
@@ -609,15 +674,22 @@ async def telegram_command_handler(request: Request):
             cfg.trade.enabled = True
             await send_direct_tg("🚀 Trading Engine **RESUMED**")
 
+        elif cmd == "/pause":
+            cfg.trade.enabled = False
+            await send_direct_tg("🛑 Trading Engine **PAUSED** (Read-Only)")
+
         elif cmd == "/help":
             help_text = (
                 "📖 **QuikPulse Guide**\n"
                 "/status - System health\n"
                 "/list - Show tracked wallets\n"
+                "/hunt - ROI Leaderboard & Audit stats\n"
                 "/pair [SYMBOL] - Monitor CEX pair\n"
+                "/rempair [SYMBOL] - Stop monitoring pair\n"
                 "/addwallet [ADDR] - Track DEX address\n"
-                "/remwallet [ADDR] - Stop tracking\n"
-                "/resume - Start auto-trading"
+                "/remwallet [ADDR] - Stop tracking address\n"
+                "/resume - Start auto-trading\n"
+                "/pause - Disable auto-trading"
             )
             await send_direct_tg(help_text)
 
@@ -693,8 +765,18 @@ async def wallet_refresh_loop():
         await asyncio.sleep(1800)
         await store.refresh_wallet_cache()
 
-async def notify_new_signal(sig, session, cfg, is_whale=False, is_sniper=False, is_squeeze=False):
-    prefix = "🚨 *SQUEEZE*" if is_squeeze else "🎯 *SNIPER*" if is_sniper else "🐋 *WHALE*" if is_whale else "🚀 *SIGNAL*"
+async def notify_new_signal(sig, session, cfg, is_whale=False, is_sniper=False, is_squeeze=False, priority=0):
+    if priority == 2:
+        prefix = "⚡ *EXPERT SNIPE*"
+    elif is_squeeze:
+        prefix = "🚨 *SQUEEZE*"
+    elif is_sniper:
+        prefix = "🎯 *SNIPER*"
+    elif is_whale:
+        prefix = "🐋 *WHALE*"
+    else:
+        prefix = "🚀 *SIGNAL*"
+        
     msg = (f"{prefix}\nPair: `{sig['symbol']}`\nAction: {sig['signal']}\nEntry: `${sig['entry']}`")
     if sig.get("sl"): msg += f"\nSL: `${sig['sl']}`"
     if sig.get("tp"): msg += f"\nTP: `${sig['tp']}`"
