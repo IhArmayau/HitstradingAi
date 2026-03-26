@@ -111,8 +111,8 @@ class BotSetting(Base):
 # Configs & Environment
 # -----------------------------
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
-ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY", "") # Use for RPC
-ALCHEMY_AUTH_TOKEN = os.getenv("ALCHEMY_AUTH_TOKEN", "") # Use for Webhook Sync
+ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY", "") 
+ALCHEMY_AUTH_TOKEN = os.getenv("ALCHEMY_AUTH_TOKEN", "") 
 ALCHEMY_WEBHOOK_ID = os.getenv("ALCHEMY_WEBHOOK_ID", "")
 ALCHEMY_RPC_URL = f"https://solana-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
 SANTIMENT_API_KEY = os.getenv("SANTIMENT_API_KEY", "Eo6zp2wemnkb4cui_thgwsepbufktb4qz")
@@ -157,10 +157,10 @@ class BotConfig:
     ml_model_path: str = os.getenv("ML_MODEL_PATH", "models/lstm_model.h5")
     telegram_bot_token: Optional[str] = os.getenv("TELEGRAM_BOT_TOKEN")
     telegram_chat_id: Optional[str] = os.getenv("TELEGRAM_CHAT_ID")
-    model_version: str = "v7.6-helius-proof"
+    model_version: str = "v7.7-alchemy-prod"
 
 # -----------------------------
-# Production Utility: API Resilience
+# Utility: API Resilience
 # -----------------------------
 async def request_with_retry(session: aiohttp.ClientSession, method: str, url: str, retries: int = 3, **kwargs):
     for i in range(retries):
@@ -268,7 +268,6 @@ class SignalStore:
 # Alchemy Sync Utility
 # -----------------------------
 async def sync_alchemy_webhook(addresses: List[str]):
-    """Keeps Alchemy Webhook in sync with Database Tracked Wallets using Auth Token"""
     if not ALCHEMY_AUTH_TOKEN or not ALCHEMY_WEBHOOK_ID: return
     url = f"https://dashboard.alchemy.com/api/update-webhook-addresses"
     headers = {"X-Alchemy-Token": ALCHEMY_AUTH_TOKEN, "Content-Type": "application/json"}
@@ -501,43 +500,32 @@ async def shutdown():
 
 @app.post("/webhook")
 async def combined_webhook_handler(request: Request):
-    """
-    Enhanced Webhook Handler: Supports both Helius and Alchemy Notify
-    """
     try:
         data = await request.json()
         db_wallets = store.wallet_cache
 
-        # 1. ALCHEMY NOTIFY PARSER (Takeover)
+        # Alchemy Notify Logic
         if isinstance(data, dict) and "event" in data:
             for act in data.get("event", {}).get("activity", []):
                 buyer = act.get("fromAddress")
                 mint = act.get("rawContract", {}).get("address")
                 if not mint or not buyer: continue
-
-                # Deduplication: Check if we are already in this trade
                 if await store.has_open_signal(mint): continue
-
                 dex_info = await generator.dex.get_price_data(mint)
                 await store.insert_candidate(buyer, mint, dex_info['price'])
                 is_whale = await generator.hunter.is_whale_funded(buyer)
                 is_sniper = buyer in db_wallets
-
                 if is_sniper or is_whale:
                     await process_dex_signal(mint, buyer, is_whale, is_sniper)
 
-        # 2. HELIUS WEBHOOK PARSER (Original)
+        # Helius Webhook Logic
         elif isinstance(data, list):
             for event in data:
                 if event.get("type") != "SWAP": continue
                 swap = event.get("events", {}).get("swap", {})
                 mint, buyer = swap.get("tokenOutMint"), event.get("feePayer")
-
-                # Deduplication
                 if await store.has_open_signal(mint): continue
-
                 is_whale, is_sniper = await generator.hunter.is_whale_funded(buyer), buyer in db_wallets
-
                 if is_sniper or is_whale:
                     await process_dex_signal(mint, buyer, is_whale, is_sniper)
 
@@ -596,43 +584,42 @@ async def telegram_command_handler(request: Request):
 
         elif cmd == "/pair":
             if len(parts) > 1:
-                input_val = parts[1]
-                if "/" in input_val:
-                    pair = input_val.upper()
-                    await exchange.load_markets()
-                    if pair in exchange.markets:
-                        async with store.async_session() as session_db:
-                            await session_db.merge(MonitoredPair(symbol=pair))
-                            await session_db.commit()
-                            if pair not in cfg.symbols: cfg.symbols.append(pair)
-                            await send_direct_tg(f"✅ CEX Pair `{pair}` monitoring enabled.")
-                    else:
-                        await send_direct_tg(f"❌ `{pair}` not found on KuCoin.")
+                pair = parts[1].upper()
+                await exchange.load_markets()
+                if pair in exchange.markets:
+                    async with store.async_session() as session_db:
+                        await session_db.merge(MonitoredPair(symbol=pair))
+                        await session_db.commit()
+                        if pair not in cfg.symbols: cfg.symbols.append(pair)
+                        await send_direct_tg(f"✅ CEX Pair `{pair}` enabled.")
                 else:
-                    await store.add_tracked_wallet(input_val, "Manual")
-                    await send_direct_tg(f"✅ Wallet `{input_val[:6]}...` tracked.")
+                    await send_direct_tg(f"❌ `{pair}` not found.")
 
-        elif cmd in ["/untrack", "/remove", "/delete"]:
-            if len(parts) > 1:
-                target = parts[1]
-                if "/" in target:
-                    target = target.upper()
-                    if target in cfg.symbols:
-                        cfg.symbols.remove(target)
-                        await store.remove_cex_pair(target)
-                        await send_direct_tg(f"❌ Removed CEX pair: `{target}`")
-                else:
-                    await store.remove_tracked_wallet(target)
-                    await send_direct_tg(f"❌ Stopped tracking wallet: `{target}`")
-
-        elif cmd == "/track":
+        elif cmd == "/addwallet":
             if len(parts) > 1:
                 await store.add_tracked_wallet(parts[1], "Manual")
-                await send_direct_tg(f"✅ Now tracking wallet: `{parts[1]}`")
+                await send_direct_tg(f"✅ Now tracking: `{parts[1]}`")
+
+        elif cmd == "/remwallet":
+            if len(parts) > 1:
+                await store.remove_tracked_wallet(parts[1])
+                await send_direct_tg(f"❌ Stopped tracking: `{parts[1]}`")
 
         elif cmd == "/resume":
             cfg.trade.enabled = True
             await send_direct_tg("🚀 Trading Engine **RESUMED**")
+
+        elif cmd == "/help":
+            help_text = (
+                "📖 **QuikPulse Guide**\n"
+                "/status - System health\n"
+                "/list - Show tracked wallets\n"
+                "/pair [SYMBOL] - Monitor CEX pair\n"
+                "/addwallet [ADDR] - Track DEX address\n"
+                "/remwallet [ADDR] - Stop tracking\n"
+                "/resume - Start auto-trading"
+            )
+            await send_direct_tg(help_text)
 
         return JSONResponse({"status": "success"})
     except Exception as e:
@@ -675,7 +662,6 @@ async def hunting_audit_loop():
                 cleanup_cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
                 await session_db.execute(delete(WalletCandidate).where(WalletCandidate.timestamp < cleanup_cutoff))
                 await session_db.commit()
-
         except Exception as e: logger.error(f"Hunter Loop Error: {e}")
 
 async def centralized_dex_watcher():
