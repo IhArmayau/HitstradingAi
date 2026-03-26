@@ -1,0 +1,76 @@
+<tbody
+    class="divide-y divide-white/5"
+    id="signal-table-body"
+    hx-get="/signals"
+    hx-trigger="every 5s"
+    hx-swap="outerHTML">
+    {% if signals %}
+        {% for sig in signals %}
+        <tr class="hover:bg-white/[0.03] transition-colors group">
+            <td class="px-8 py-6">
+                <div class="flex items-center gap-4">
+                    <div class="w-10 h-10 rounded-full bg-slate-800 flex items-center justify-center border border-white/10 group-hover:border-blue-500/50 transition-all">
+                        {% if (sig.confidence|default(0)|float) >= 85.0 %}<i class="fa-solid fa-fire text-amber-500 animate-pulse"></i>
+                        {% elif sig.market_type == 'DEX' %}<i class="fa-solid fa-microchip text-purple-400"></i>
+                        {% else %}<i class="fa-solid fa-chart-line text-blue-400"></i>{% endif %}
+                    </div>
+                    <div>
+                        <div class="font-bold text-white flex items-center gap-2">
+                            {{ sig.symbol }}
+                            <span class="text-[9px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-white/5 uppercase">{{ sig.market_type }}</span>
+                        </div>
+                        <div class="text-[10px] text-slate-500 font-mono tracking-tighter">
+                            Entry: ${{ sig.entry|default('0.00') }}
+                        </div>
+                    </div>
+                </div>
+            </td>
+            <td class="px-6 py-6">
+                <div class="flex flex-col gap-1">
+                    {% if sig.market_type == 'CEX' %}
+                        <div class="text-[9px] font-bold text-slate-500 uppercase">
+                            Funding: <span class="{{ 'text-green-400' if sig.funding and sig.funding|float < 0 else 'text-red-400' }}">
+                                {{ ((sig.funding or 0)|float * 100) | round(4) }}%
+                            </span>
+                        </div>
+                        <div class="text-[9px] font-bold text-slate-500 uppercase">
+                            OI: <span class="text-blue-400">${{ sig.open_interest | round(0) if sig.open_interest else '0' }}</span>
+                        </div>
+                    {% else %}
+                        <div class="text-[9px] font-bold text-slate-500 uppercase">V/L Ratio: <span class="text-amber-400">{{ sig.vol_liq_ratio | round(2) if sig.vol_liq_ratio else '0.00' }}</span></div>
+                        <div class="text-[9px] font-bold text-slate-500 uppercase">On-Chain Sniper</div>
+                    {% endif %}
+                </div>
+            </td>
+            <td class="px-6 py-6">
+                <div class="w-24">
+                    <div class="flex justify-between text-[10px] font-bold mb-1.5 uppercase">
+                        <span class="text-slate-500">ML Confidence</span>
+                        <span class="text-blue-400">{{ sig.confidence | round(0) if sig.confidence else '0' }}%</span>
+                    </div>
+                    <div class="h-1 bg-slate-800 rounded-full overflow-hidden">
+                        <div class="progress-fill h-full bg-blue-500" style="width: {{ sig.confidence if sig.confidence else 0 }}%"></div>
+                    </div>
+                </div>
+            </td>
+            <td class="px-6 py-6">
+                {% set action = (sig.signal|string)|upper %}
+                <span class="px-4 py-1.5 rounded-md text-[10px] font-black uppercase tracking-widest {{ 'bg-green-500/10 text-green-400 border border-green-500/20' if 'BUY' in action else 'bg-red-500/10 text-red-400 border border-red-500/20' }}">
+                    {{ sig.signal|string if sig.signal else 'N/A' }}
+                </span>
+            </td>
+            <td class="px-8 py-6 text-right">
+                <div class="text-[10px] font-bold uppercase {{ 'text-green-500' if sig.status == 'open' else 'text-slate-500' }}">
+                    {{ sig.status|string if sig.status else 'closed' }}
+                </div>
+            </td>
+        </tr>
+        {% endfor %}
+    {% else %}
+        <tr>
+            <td colspan="5" class="py-32 text-center text-slate-500">
+                Scanning for high-probability setups...
+            </td>
+        </tr>
+    {% endif %}
+</tbody>

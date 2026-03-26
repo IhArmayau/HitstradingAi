@@ -384,21 +384,25 @@ async def health():
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
+    # This route now only serves the main dashboard shell
+    return templates.TemplateResponse("index.html", {
+        "request": request,
+        "bot_status": "ONLINE",
+        "version": cfg.model_version
+    })
+
+@app.get("/signals", response_class=HTMLResponse)
+async def get_signals_partial(request: Request):
+    # This is the HTMX route that returns ONLY the <tbody> fragment
     try:
-        # Fetch data and ensure it's a serializable list of dicts
         raw_signals = await store.get_latest_signals()
-        
-        # Explicitly building context as a flat dict to prevent "unhashable" template errors
-        template_context = {
+        return templates.TemplateResponse("signals_partial.html", {
             "request": request,
-            "signals": raw_signals,
-            "bot_status": "ONLINE",
-            "version": cfg.model_version
-        }
-        return templates.TemplateResponse("index.html", template_context)
+            "signals": raw_signals
+        })
     except Exception as e:
-        logger.error(f"Template Render Error: {e}")
-        return HTMLResponse(content=f"Dashboard Rendering Error: {str(e)}", status_code=500)
+        logger.error(f"Partial Render Error: {e}")
+        return HTMLResponse(content="<tr><td colspan='5' class='py-10 text-center text-red-500'>Backend Error</td></tr>", status_code=500)
 
 @app.post("/webhook")
 async def helius_webhook(request: Request):
