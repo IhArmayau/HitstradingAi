@@ -8,6 +8,7 @@ import logging
 import os
 import json
 import pickle
+import sys
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Any
 from datetime import datetime, timezone, timedelta
@@ -26,9 +27,21 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import Column, Integer, String, Float, Text, select, delete
 
 # -----------------------------
-# Database Setup
+# Logging Configuration (Optimized for Render/Stdout)
 # -----------------------------
 load_dotenv()
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+logging.basicConfig(
+    level=LOG_LEVEL,
+    stream=sys.stdout,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("QuikPulseAI")
+
+# -----------------------------
+# Database Setup
+# -----------------------------
 DATABASE_URL = os.getenv("DATABASE_URL")
 if DATABASE_URL:
     if DATABASE_URL.startswith("postgres://"):
@@ -75,11 +88,8 @@ class BotSetting(Base):
 # -----------------------------
 # Configs & Environment
 # -----------------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
 SANTIMENT_API_KEY = os.getenv("SANTIMENT_API_KEY", "Eo6zp2wemnkb4cui_thgwsepbufktb4qz")
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-logger = logging.getLogger("QuikPulseAI")
 
 if SANTIMENT_API_KEY:
     san.ApiConfig.api_key = SANTIMENT_API_KEY
@@ -144,7 +154,8 @@ async def request_with_retry(session: aiohttp.ClientSession, method: str, url: s
 # -----------------------------
 class SignalStore:
     def __init__(self, db_url: str):
-        self.engine = create_async_engine(db_url, pool_size=10, max_overflow=20, pool_pre_ping=True, pool_recycle=1800)
+        # FIX: Removed pool_size/max_overflow which can cause issues with some asyncpg drivers on cloud hosts
+        self.engine = create_async_engine(db_url, pool_pre_ping=True, pool_recycle=1800)
         self.async_session = sessionmaker(self.engine, expire_on_commit=False, class_=AsyncSession)
         self.symbol_locks = {}
 
@@ -247,7 +258,8 @@ class DexEngine:
                         "vol24": float(p.get('volume', {}).get('h24', 0)),
                         "liq": float(p.get('liquidity', {}).get('usd', 0))
                     }
-        except: pass
+        except Exception as e:
+            logger.error(f"DexEngine Fetch Error: {e}")
         return {"price": 0, "symbol": "UNK", "vol24": 0, "liq": 0}
 
 class ClusterEngine:
@@ -294,7 +306,10 @@ class SignalGenerator:
         try:
             if os.path.exists(self.cfg.ml_model_path):
                 with open(self.cfg.ml_model_path, 'rb') as f: return pickle.load(f)
-        except: pass
+            else:
+                logger.warning(f"ML Model file missing at {self.cfg.ml_model_path}. Defaulting to heuristic confidence.")
+        except Exception as e:
+            logger.error(f"Error loading ML model: {e}")
         return None
 
     def predict_confidence(self, features: list) -> float:
@@ -384,7 +399,6 @@ async def health():
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    # This route now only serves the main dashboard shell
     return templates.TemplateResponse("index.html", {
         "request": request,
         "bot_status": "ONLINE",
@@ -393,7 +407,6 @@ async def index(request: Request):
 
 @app.get("/signals", response_class=HTMLResponse)
 async def get_signals_partial(request: Request):
-    # This is the HTMX route that returns ONLY the <tbody> fragment
     try:
         raw_signals = await store.get_latest_signals()
         return templates.TemplateResponse("signals_partial.html", {
@@ -407,17 +420,24 @@ async def get_signals_partial(request: Request):
 @app.post("/webhook")
 async def helius_webhook(request: Request):
     try:
-        data = await request.json()
+        # PRODUCTION FIX: Full request visibility
+        body = await request.body()
+        data = json.loads(body)
+        logger.info(f"🔗 [WEBHOOK] Incoming Hit: {len(data)} events detected.")
+        
         db_wallets = await store.get_all_tracked_wallets_detailed()
         for event in data:
             if event.get("type") != "SWAP": continue
             swap = event.get("events", {}).get("swap", {})
             mint, buyer = swap.get("tokenOutMint"), event.get("feePayer")
             
+            logger.info(f"🔍 [SCAN] Processing swap: {mint} | Wallet: {buyer}")
+            
             is_whale = await generator.hunter.is_whale_funded(buyer)
             is_sniper = buyer in db_wallets
 
             if (is_sniper or is_whale) and not await store.has_open_signal(mint):
+                logger.info(f"🎯 [TARGET] Valid Signal for {mint} (Whale={is_whale}, Sniper={is_sniper})")
                 dex_data = await generator.dex.get_price_data(mint)
                 safety = await generator.security.get_safety_report(mint, dex_data['vol24'], dex_data['liq'])
                 
@@ -438,7 +458,7 @@ async def helius_webhook(request: Request):
                     
         return JSONResponse(content={"status": "success"}, status_code=200)
     except Exception as e: 
-        logger.error(f"Webhook Error: {e}")
+        logger.error(f"❌ [WEBHOOK ERROR] {e}")
         return JSONResponse(content={"status": "error", "message": str(e)}, status_code=500)
 
 async def centralized_dex_watcher():
@@ -477,6 +497,7 @@ async def startup():
     
     background_tasks.add(monitor_task)
     background_tasks.add(dex_watcher_task)
+    logger.info(f"✅ QuikPulse AI {cfg.model_version} Startup Complete.")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -507,7 +528,15 @@ async def send_direct_tg(text: str):
     try:
         url = f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage"
         await request_with_retry(session, "POST", url, json={"chat_id": cfg.telegram_chat_id, "text": text, "parse_mode": "Markdown"})
-    except: pass
+    except Exception as e:
+        logger.error(f"Telegram notification failed: {e}")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    # PRODUCTION FIX: Log Level to INFO for Render visibility
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=int(os.getenv("PORT", 8000)),
+        log_level="info",
+        access_log=True
+    )
