@@ -57,7 +57,7 @@ class SignalModel(Base):
     is_cluster = Column(Integer, default=0)
     status = Column(String, default='open')
     model_version = Column(String)
-    vol_liq_ratio = Column(Float, default=0.0)
+    vol_liq_ratio = Column(Float, default=0.0) # Correctly mapped to UI
     time_to_close = Column(Integer, nullable=True)
 
 class TrackedWallet(Base):
@@ -144,8 +144,7 @@ async def request_with_retry(session: aiohttp.ClientSession, method: str, url: s
 # -----------------------------
 class SignalStore:
     def __init__(self, db_url: str):
-        # Increased pool size for Render performance
-        self.engine = create_async_engine(db_url, pool_size=10, max_overflow=20, pool_pre_ping=True)
+        self.engine = create_async_engine(db_url, pool_size=10, max_overflow=20, pool_pre_ping=True, pool_recycle=1800)
         self.async_session = sessionmaker(self.engine, expire_on_commit=False, class_=AsyncSession)
         self.symbol_locks = {}
 
@@ -167,16 +166,20 @@ class SignalStore:
 
     async def get_latest_signals(self, limit: int = 25):
         async with self.async_session() as session:
-            result = await session.execute(select(SignalModel).order_by(SignalModel.id.desc()).limit(limit))
-            rows = result.scalars().all()
-            return [{
-                "id": int(r.id), "symbol": str(r.symbol), "signal": str(r.signal),
-                "entry": float(r.entry or 0.0), "sl": float(r.sl) if r.sl else None,
-                "tp": float(r.tp) if r.tp else None, "confidence": float(r.confidence or 0.0),
-                "market_type": str(r.market_type), "status": str(r.status),
-                "funding": float(r.funding or 0.0), "open_interest": float(r.open_interest or 0.0),
-                "sentiment_score": float(r.sentiment_score or 50.0)
-            } for r in rows]
+            try:
+                result = await session.execute(select(SignalModel).order_by(SignalModel.id.desc()).limit(limit))
+                rows = result.scalars().all()
+                return [{
+                    "id": int(r.id), "symbol": str(r.symbol), "signal": str(r.signal),
+                    "entry": float(r.entry or 0.0), "sl": float(r.sl) if r.sl else None,
+                    "tp": float(r.tp) if r.tp else None, "confidence": float(r.confidence or 0.0),
+                    "market_type": str(r.market_type), "status": str(r.status),
+                    "funding": float(r.funding or 0.0), "open_interest": float(r.open_interest or 0.0),
+                    "sentiment_score": float(r.sentiment_score or 50.0),
+                    "vol_liq_ratio": float(r.vol_liq_ratio or 0.0) # Passed to Jinja template
+                } for r in rows]
+            finally:
+                await session.close()
 
     async def has_open_signal(self, iden: str):
         async with self.async_session() as session:
@@ -263,8 +266,8 @@ class SecurityEngine:
         self.session = session
 
     async def get_safety_report(self, address: str, vol_24h: float, liq: float) -> Dict[str, Any]:
-        vl_ratio = vol_24h / liq if liq > 0 else 999.0
-        return {"safety_score": 80 if vl_ratio < 5 else 40, "is_rugged": vl_ratio > 10.0, "vl_ratio": vl_ratio}
+        vl_ratio = vol_24h / liq if liq > 0 else 0.0
+        return {"safety_score": 80 if (0 < vl_ratio < 5) else 40, "is_rugged": vl_ratio > 10.0, "vl_ratio": vl_ratio}
 
 # -----------------------------
 # Production Execution Engine (Signal Only)
@@ -282,7 +285,7 @@ class SignalGenerator:
         self.dex, self.security = DexEngine(session), SecurityEngine(session)
         self.hunter = DiscoveryHunter(HELIUS_API_KEY, session, cfg)
         self.executor = TradeExecutor(cfg)
-        self.active_monitors = set()
+        self.active_monitors_data: Dict[str, float] = {} 
         self.cooldown_cache = {}
         self.prev_oi = {}
         self.ml_model = self._load_model()
@@ -353,7 +356,8 @@ class SignalGenerator:
                         "entry": entry_price, "sl": round(sl, 6), "tp": round(tp, 6),
                         "confidence": self.predict_confidence([funding, social['score']]),
                         "sentiment_score": social['score'], "funding": funding, "open_interest": oi,
-                        "model_version": self.cfg.model_version
+                        "model_version": self.cfg.model_version,
+                        "vol_liq_ratio": 0.0 # Default for CEX
                     }
                     await self.store.insert_signal(sig)
                     self.cooldown_cache[symbol] = datetime.now()
@@ -382,7 +386,6 @@ async def health():
 async def index(request: Request):
     try:
         signals_data = await store.get_latest_signals()
-        # FIX: Explicitly defined context as named argument to avoid Jinja 3.13 hashing error
         context = {
             "request": request,
             "signals": signals_data,
@@ -398,8 +401,6 @@ async def index(request: Request):
 async def helius_webhook(request: Request):
     try:
         data = await request.json()
-        logger.info(f"Webhook Received: {len(data) if isinstance(data, list) else 1} events")
-        
         db_wallets = await store.get_all_tracked_wallets_detailed()
         for event in data:
             if event.get("type") != "SWAP": continue
@@ -411,39 +412,51 @@ async def helius_webhook(request: Request):
 
             if (is_sniper or is_whale) and not await store.has_open_signal(mint):
                 dex_data = await generator.dex.get_price_data(mint)
+                # Added Security Engine logic for the ratio
+                safety = await generator.security.get_safety_report(mint, dex_data['vol24'], dex_data['liq'])
+                
                 sig = {
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "symbol": dex_data['symbol'], "market_type": "DEX", "contract_address": mint,
-                    "signal": "BUY", "entry": dex_data['price'], "confidence": 95.0, "model_version": cfg.model_version
+                    "signal": "BUY", "entry": dex_data['price'], "confidence": 95.0, 
+                    "model_version": cfg.model_version,
+                    "vol_liq_ratio": safety['vl_ratio'], # Populating the ratio for DEX
+                    "safety_score": safety['safety_score']
                 }
                 await store.insert_signal(sig)
                 await generator.executor.execute_trade(sig)
                 await notify_new_signal(sig, session, cfg, is_whale=is_whale, is_sniper=is_sniper)
-                if mint not in generator.active_monitors:
-                    task = asyncio.create_task(monitor_dex_exit(mint, float(dex_data['price'])))
-                    background_tasks.add(task)
-                    task.add_done_callback(background_tasks.discard)
-        # FIX: Return JSONResponse for webhooks to avoid Jinja involvement
+                
+                if mint not in generator.active_monitors_data:
+                    generator.active_monitors_data[mint] = float(dex_data['price'])
+                    
         return JSONResponse(content={"status": "success"}, status_code=200)
     except Exception as e: 
         logger.error(f"Webhook Error: {e}")
         return JSONResponse(content={"status": "error", "message": str(e)}, status_code=500)
 
-async def monitor_dex_exit(mint: str, entry: float):
-    generator.active_monitors.add(mint)
-    try:
-        while True:
+async def centralized_dex_watcher():
+    while True:
+        try:
+            tokens_to_check = list(generator.active_monitors_data.items())
+            for mint, entry in tokens_to_check:
+                data = await generator.dex.get_price_data(mint)
+                if data['price'] <= 0: continue
+                
+                if data['price'] >= entry * 1.5:
+                    await send_direct_tg(f"💰 **DEX TP**\nToken: `{data['symbol']}`\nGain: `+50%`")
+                    generator.active_monitors_data.pop(mint, None)
+                elif data['price'] <= entry * 0.8:
+                    await send_direct_tg(f"⚠️ **DEX SL**\nToken: `{data['symbol']}`\nLoss: `-20%`")
+                    generator.active_monitors_data.pop(mint, None)
+                
+                await asyncio.sleep(2)
+                
             await asyncio.sleep(60)
-            data = await generator.dex.get_price_data(mint)
-            if data['price'] <= 0: continue
-            if data['price'] >= entry * 1.5:
-                await send_direct_tg(f"💰 **DEX TP**\nToken: `{data['symbol']}`\nGain: `+50%`")
-                break
-            if data['price'] <= entry * 0.8:
-                await send_direct_tg(f"⚠️ **DEX SL**\nToken: `{data['symbol']}`\nLoss: `-20%`")
-                break
-    except Exception as e: logger.error(f"DEX Exit Error: {e}")
-    finally: generator.active_monitors.remove(mint)
+        except asyncio.CancelledError: break
+        except Exception as e:
+            logger.error(f"DEX Watcher Error: {e}")
+            await asyncio.sleep(60)
 
 @app.on_event("startup")
 async def startup():
@@ -452,8 +465,12 @@ async def startup():
     session = aiohttp.ClientSession()
     sentinel = SocialSentinel(SANTIMENT_API_KEY, session)
     generator = SignalGenerator(cfg, store, exchange, sentinel, cluster_map, session)
+    
     monitor_task = asyncio.create_task(background_monitor())
+    dex_watcher_task = asyncio.create_task(centralized_dex_watcher())
+    
     background_tasks.add(monitor_task)
+    background_tasks.add(dex_watcher_task)
 
 @app.on_event("shutdown")
 async def shutdown():
