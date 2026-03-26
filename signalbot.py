@@ -57,7 +57,7 @@ class SignalModel(Base):
     is_cluster = Column(Integer, default=0)
     status = Column(String, default='open')
     model_version = Column(String)
-    vol_liq_ratio = Column(Float, default=0.0) # Correctly mapped to UI
+    vol_liq_ratio = Column(Float, default=0.0) 
     time_to_close = Column(Integer, nullable=True)
 
 class TrackedWallet(Base):
@@ -176,7 +176,7 @@ class SignalStore:
                     "market_type": str(r.market_type), "status": str(r.status),
                     "funding": float(r.funding or 0.0), "open_interest": float(r.open_interest or 0.0),
                     "sentiment_score": float(r.sentiment_score or 50.0),
-                    "vol_liq_ratio": float(r.vol_liq_ratio or 0.0) # Passed to Jinja template
+                    "vol_liq_ratio": float(r.vol_liq_ratio or 0.0)
                 } for r in rows]
             finally:
                 await session.close()
@@ -270,7 +270,7 @@ class SecurityEngine:
         return {"safety_score": 80 if (0 < vl_ratio < 5) else 40, "is_rugged": vl_ratio > 10.0, "vl_ratio": vl_ratio}
 
 # -----------------------------
-# Production Execution Engine (Signal Only)
+# Production Execution Engine
 # -----------------------------
 class TradeExecutor:
     def __init__(self, cfg: BotConfig):
@@ -357,7 +357,7 @@ class SignalGenerator:
                         "confidence": self.predict_confidence([funding, social['score']]),
                         "sentiment_score": social['score'], "funding": funding, "open_interest": oi,
                         "model_version": self.cfg.model_version,
-                        "vol_liq_ratio": 0.0 # Default for CEX
+                        "vol_liq_ratio": 0.0 
                     }
                     await self.store.insert_signal(sig)
                     self.cooldown_cache[symbol] = datetime.now()
@@ -387,12 +387,12 @@ async def index(request: Request):
     try:
         signals_data = await store.get_latest_signals()
         context = {
-            "request": request,
             "signals": signals_data,
             "bot_status": "ONLINE",
             "version": cfg.model_version
         }
-        return templates.TemplateResponse(name="index.html", context=context)
+        # Fixed: Explicitly passing request object to resolve 500 Error
+        return templates.TemplateResponse("index.html", {"request": request, **context})
     except Exception as e:
         logger.error(f"Template Render Error: {e}")
         return HTMLResponse(content="Dashboard Rendering Error", status_code=500)
@@ -412,7 +412,6 @@ async def helius_webhook(request: Request):
 
             if (is_sniper or is_whale) and not await store.has_open_signal(mint):
                 dex_data = await generator.dex.get_price_data(mint)
-                # Added Security Engine logic for the ratio
                 safety = await generator.security.get_safety_report(mint, dex_data['vol24'], dex_data['liq'])
                 
                 sig = {
@@ -420,7 +419,7 @@ async def helius_webhook(request: Request):
                     "symbol": dex_data['symbol'], "market_type": "DEX", "contract_address": mint,
                     "signal": "BUY", "entry": dex_data['price'], "confidence": 95.0, 
                     "model_version": cfg.model_version,
-                    "vol_liq_ratio": safety['vl_ratio'], # Populating the ratio for DEX
+                    "vol_liq_ratio": safety['vl_ratio'],
                     "safety_score": safety['safety_score']
                 }
                 await store.insert_signal(sig)
