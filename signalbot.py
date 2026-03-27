@@ -462,7 +462,11 @@ class SignalGenerator:
 # FastAPI Service
 # -----------------------------
 app = FastAPI()
-templates = Jinja2Templates(directory="templates")
+
+# Template Setup for Render/Linux
+base_dir = os.path.dirname(os.path.realpath(__file__))
+templates = Jinja2Templates(directory=os.path.join(base_dir, "templates"))
+
 cfg = BotConfig()
 store = SignalStore(DATABASE_URL)
 cluster_map = ClusterEngine(cfg.cluster_window_minutes)
@@ -533,6 +537,28 @@ async def shutdown():
     for t in background_tasks: t.cancel()
     if session: await session.close()
     await exchange.close()
+
+# -----------------------------
+# Web & Dashboard Routes
+# -----------------------------
+
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    signals = await store.get_latest_signals(limit=25)
+    return templates.TemplateResponse("index.html", {
+        "request": request,
+        "signals": signals,
+        "bot_status": "ONLINE",
+        "version": cfg.model_version
+    })
+
+@app.get("/signals", response_class=HTMLResponse)
+async def get_signals_partial(request: Request):
+    signals = await store.get_latest_signals(limit=25)
+    return templates.TemplateResponse("signals_partial.html", {
+        "request": request,
+        "signals": signals
+    })
 
 @app.post("/webhook")
 async def combined_webhook_handler(request: Request):
