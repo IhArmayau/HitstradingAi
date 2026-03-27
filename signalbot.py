@@ -487,6 +487,8 @@ async def startup():
 async def run_background_initialization():
     global session, generator
     try:
+        logger.info("📡 Starting Background Service Initialization...")
+        
         # Load monitored pairs from DB
         async with store.async_session() as session_db:
             result = await session_db.execute(select(MonitoredPair.symbol))
@@ -497,6 +499,8 @@ async def run_background_initialization():
 
         session = aiohttp.ClientSession()
         sentinel = SocialSentinel(SANTIMENT_API_KEY, session)
+        
+        logger.info("⚙️ Mounting Signal Generator Logic...")
         generator = SignalGenerator(cfg, store, exchange, sentinel, cluster_map, session)
 
         # Telegram Webhook Setup
@@ -508,10 +512,18 @@ async def run_background_initialization():
                 logger.info(f"Telegram Webhook Status: {await resp.json()}")
 
         # Start background loops
+        logger.info("📈 Launching CEX Polling Monitor...")
         background_tasks.add(asyncio.create_task(background_monitor()))
+        
+        logger.info("🎯 Launching DEX Watcher (Position Tracking)...")
         background_tasks.add(asyncio.create_task(centralized_dex_watcher()))
+        
+        logger.info("🧬 Launching Wallet Refresh Loop...")
         background_tasks.add(asyncio.create_task(wallet_refresh_loop()))
+        
+        logger.info("🕵️ Launching Hunter Audit Engine (DEX Sniper Logic)...")
         background_tasks.add(asyncio.create_task(hunting_audit_loop()))
+        
         logger.info("✅ All background hunting engines are now LIVE and scanning.")
     except Exception as e:
         logger.error(f"CRITICAL: Background initialization failed: {e}")
@@ -524,6 +536,8 @@ async def shutdown():
 
 @app.post("/webhook")
 async def combined_webhook_handler(request: Request):
+    # Added heartbeat for incoming webhooks
+    logger.info("📡 Webhook Event Received: Incoming DEX Signal Data...")
     try:
         data = await request.json()
         db_wallets = store.wallet_cache
