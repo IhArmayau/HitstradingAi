@@ -80,7 +80,7 @@ class SignalModel(Base):
     model_version = Column(String)
     vol_liq_ratio = Column(Float, default=0.0)
     time_to_close = Column(Integer, nullable=True)
-    priority = Column(Integer, default=0) # 0: Normal, 1: Whale/Sniper, 2: Expert Hunter
+    priority = Column(Integer, default=0) 
 
 class TrackedWallet(Base):
     __tablename__ = "tracked_wallets"
@@ -358,10 +358,9 @@ class TradeExecutor:
             logger.info(f"🚫 [READ-ONLY] {sig['symbol']} Signal Detected.")
             return
         
-        # Priority Multiplier for Position Size
         pos_size = self.cfg.trade.max_position_size_usd
         if sig.get('priority') == 2:
-            pos_size = pos_size * 1.5 # 50% larger for Expert Hunters
+            pos_size = pos_size * 1.5 
             
         logger.info(f"📣 [EXECUTION] {sig['market_type']} | {sig['symbol']} | {sig['signal']} @ {sig['entry']} | Size: ${pos_size}")
 
@@ -422,7 +421,6 @@ class SignalGenerator:
         except: return 0.0, 0.0, False
 
     async def generate_cex_signal(self, symbol: str):
-        # NEW: Polling Heartbeat Log
         logger.info(f"🔍 CEX Scan: Checking {symbol} for signal conditions...")
         
         if self.cooldown_cache.get(symbol) and (datetime.now() - self.cooldown_cache[symbol]) < timedelta(minutes=self.cfg.trade.signal_cooldown_minutes):
@@ -473,34 +471,50 @@ session: Optional[aiohttp.ClientSession] = None
 generator: Optional[SignalGenerator] = None
 background_tasks = set()
 
+# PRODUCTION FIX: Background initialization to prevent Port Scan Timeout
 @app.on_event("startup")
 async def startup():
     global session, generator
+    # 1. Faster startup: Initialize Database schema only
     await store.init_db()
+    
+    # 2. Run heavy loading (Exchanges, RPCs, Logic) in a non-blocking task
+    # This lets Uvicorn open the port IMMEDIATELY so Render sees it.
+    asyncio.create_task(run_background_initialization())
+    
+    logger.info(f"🚀 QuikPulse {cfg.model_version} Port Listener Started.")
 
-    async with store.async_session() as session_db:
-        result = await session_db.execute(select(MonitoredPair.symbol))
-        db_pairs = result.scalars().all()
-        for p in db_pairs:
-            if p not in cfg.symbols:
-                cfg.symbols.append(p)
+async def run_background_initialization():
+    global session, generator
+    try:
+        # Load monitored pairs from DB
+        async with store.async_session() as session_db:
+            result = await session_db.execute(select(MonitoredPair.symbol))
+            db_pairs = result.scalars().all()
+            for p in db_pairs:
+                if p not in cfg.symbols:
+                    cfg.symbols.append(p)
 
-    session = aiohttp.ClientSession()
-    sentinel = SocialSentinel(SANTIMENT_API_KEY, session)
-    generator = SignalGenerator(cfg, store, exchange, sentinel, cluster_map, session)
+        session = aiohttp.ClientSession()
+        sentinel = SocialSentinel(SANTIMENT_API_KEY, session)
+        generator = SignalGenerator(cfg, store, exchange, sentinel, cluster_map, session)
 
-    public_url = os.getenv("RENDER_EXTERNAL_URL")
-    if public_url and cfg.telegram_bot_token:
-        webhook_url = f"{public_url}/tg-webhook"
-        setup_url = f"https://api.telegram.org/bot{cfg.telegram_bot_token}/setWebhook?url={webhook_url}"
-        async with session.get(setup_url) as resp:
-            logger.info(f"Telegram Webhook Status: {await resp.json()}")
+        # Telegram Webhook Setup
+        public_url = os.getenv("RENDER_EXTERNAL_URL")
+        if public_url and cfg.telegram_bot_token:
+            webhook_url = f"{public_url}/tg-webhook"
+            setup_url = f"https://api.telegram.org/bot{cfg.telegram_bot_token}/setWebhook?url={webhook_url}"
+            async with session.get(setup_url) as resp:
+                logger.info(f"Telegram Webhook Status: {await resp.json()}")
 
-    background_tasks.add(asyncio.create_task(background_monitor()))
-    background_tasks.add(asyncio.create_task(centralized_dex_watcher()))
-    background_tasks.add(asyncio.create_task(wallet_refresh_loop()))
-    background_tasks.add(asyncio.create_task(hunting_audit_loop()))
-    logger.info(f"🚀 QuikPulse {cfg.model_version} Operational.")
+        # Start background loops
+        background_tasks.add(asyncio.create_task(background_monitor()))
+        background_tasks.add(asyncio.create_task(centralized_dex_watcher()))
+        background_tasks.add(asyncio.create_task(wallet_refresh_loop()))
+        background_tasks.add(asyncio.create_task(hunting_audit_loop()))
+        logger.info("✅ All background hunting engines are now LIVE and scanning.")
+    except Exception as e:
+        logger.error(f"CRITICAL: Background initialization failed: {e}")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -513,8 +527,6 @@ async def combined_webhook_handler(request: Request):
     try:
         data = await request.json()
         db_wallets = store.wallet_cache
-
-        # Alchemy Notify Logic
         if isinstance(data, dict) and "event" in data:
             for act in data.get("event", {}).get("activity", []):
                 buyer = act.get("fromAddress")
@@ -527,8 +539,6 @@ async def combined_webhook_handler(request: Request):
                 is_sniper = buyer in db_wallets
                 if is_sniper or is_whale:
                     await process_dex_signal(mint, buyer, is_whale, is_sniper)
-
-        # Helius Webhook Logic
         elif isinstance(data, list):
             for event in data:
                 if event.get("type") != "SWAP": continue
@@ -538,26 +548,20 @@ async def combined_webhook_handler(request: Request):
                 is_whale, is_sniper = await generator.hunter.is_whale_funded(buyer), buyer in db_wallets
                 if is_sniper or is_whale:
                     await process_dex_signal(mint, buyer, is_whale, is_sniper)
-
         return JSONResponse({"status": "success"})
     except Exception as e:
         logger.error(f"Webhook Failure: {e}")
         return JSONResponse({"status": "error"}, status_code=500)
 
 async def process_dex_signal(mint: str, buyer: str, is_whale: bool, is_sniper: bool):
-    # Determine Priority Level
     priority_level = 0
     buyer_label = store.wallet_cache.get(buyer, "")
-    
-    if "Expert-Hunter" in buyer_label:
-        priority_level = 2
-    elif is_sniper or is_whale:
-        priority_level = 1
+    if "Expert-Hunter" in buyer_label: priority_level = 2
+    elif is_sniper or is_whale: priority_level = 1
 
     dex_data = await generator.dex.get_price_data(mint)
     if dex_data['price'] <= 0: return
     safety = await generator.security.get_safety_report(mint, dex_data['vol24'], dex_data['liq'])
-    
     sig = {
         "timestamp": datetime.now(timezone.utc).isoformat(), "symbol": dex_data['symbol'],
         "market_type": "DEX", "contract_address": mint, "signal": "BUY", "entry": dex_data['price'],
@@ -565,7 +569,6 @@ async def process_dex_signal(mint: str, buyer: str, is_whale: bool, is_sniper: b
         "model_version": cfg.model_version, "vol_liq_ratio": safety['vl_ratio'],
         "safety_score": safety['safety_score'], "priority": priority_level
     }
-    
     await store.insert_signal(sig)
     await generator.executor.execute_trade(sig)
     await notify_new_signal(sig, session, cfg, is_whale=is_whale, is_sniper=is_sniper, priority=priority_level)
@@ -593,56 +596,37 @@ async def telegram_command_handler(request: Request):
                 f"━━━━━━━━━━━━━━━"
             )
             await send_direct_tg(res)
-
         elif cmd == "/list":
             wallets = store.wallet_cache
-            if not wallets:
-                await send_direct_tg("📭 No insiders currently tracked.")
+            if not wallets: await send_direct_tg("📭 No insiders currently tracked.")
             else:
                 msg = "🎯 **Tracked Insiders**\n\n"
                 for i, (addr, label) in enumerate(wallets.items(), 1):
                     msg += f"{i}. `{addr}`\n   └ Label: *{label}*\n"
                 await send_direct_tg(msg)
-
         elif cmd == "/hunt":
             async with store.async_session() as session_db:
                 total_c = await session_db.execute(select(func.count(WalletCandidate.id)))
                 wins = await session_db.execute(select(func.count(WalletCandidate.id)).where(WalletCandidate.is_win == 1))
-                
-                # ROI Performance Leaderboard (Top 3)
                 cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
                 stmt = select(WalletCandidate).where(WalletCandidate.timestamp >= cutoff).limit(20)
                 res = await session_db.execute(stmt)
                 candidates = res.scalars().all()
-                
                 leaderboard = []
                 for c in candidates:
                     curr = await generator.dex.get_price_data(c.token_mint)
                     if curr['price'] > 0 and c.entry_price > 0:
                         roi = ((curr['price'] - c.entry_price) / c.entry_price) * 100
                         leaderboard.append((c.address, roi, curr['symbol']))
-                
                 leaderboard.sort(key=lambda x: x[1], reverse=True)
                 top_3 = leaderboard[:3]
-
-                msg = (
-                    f"🧬 **Hunter Audit Status**\n"
-                    f"━━━━━━━━━━━━━━━\n"
-                    f"🕵️ Candidates: `{total_c.scalar()}`\n"
-                    f"🏆 Confirmed Wins: `{wins.scalar()}`\n\n"
-                    f"🔥 **Top 24h Performers:**\n"
-                )
-                
-                if not top_3:
-                    msg += "_No active performers found._"
+                msg = (f"🧬 **Hunter Audit Status**\n━━━━━━━━━━━━━━━\n🕵️ Candidates: `{total_c.scalar()}`\n🏆 Confirmed Wins: `{wins.scalar()}`\n\n🔥 **Top 24h Performers:**\n")
+                if not top_3: msg += "_No active performers found._"
                 else:
                     for i, (addr, roi, sym) in enumerate(top_3, 1):
                         msg += f"{i}. `{addr[:6]}...` | *{sym}* | **+{roi:.1f}%**\n"
-                
-                msg += f"\n━━━━━━━━━━━━━━━\n"
-                msg += f"⏱️ Window: `24h` | Mult: `{cfg.min_hunter_profit_mult}x`"
+                msg += f"\n━━━━━━━━━━━━━━━\n⏱️ Window: `24h` | Mult: `{cfg.min_hunter_profit_mult}x`"
                 await send_direct_tg(msg)
-
         elif cmd == "/pair":
             if len(parts) > 1:
                 pair = parts[1].upper()
@@ -653,49 +637,24 @@ async def telegram_command_handler(request: Request):
                         await session_db.commit()
                         if pair not in cfg.symbols: cfg.symbols.append(pair)
                         await send_direct_tg(f"✅ CEX Pair `{pair}` enabled.")
-                else:
-                    await send_direct_tg(f"❌ `{pair}` not found.")
-
-        elif cmd == "/rempair":
-            if len(parts) > 1:
-                pair = parts[1].upper()
-                await store.remove_cex_pair(pair)
-                if pair in cfg.symbols: cfg.symbols.remove(pair)
-                await send_direct_tg(f"❌ Stopped monitoring CEX: `{pair}`")
-
+                else: await send_direct_tg(f"❌ `{pair}` not found.")
         elif cmd == "/addwallet":
             if len(parts) > 1:
                 await store.add_tracked_wallet(parts[1], "Manual")
                 await send_direct_tg(f"✅ Now tracking: `{parts[1]}`")
-
         elif cmd == "/remwallet":
             if len(parts) > 1:
                 await store.remove_tracked_wallet(parts[1])
                 await send_direct_tg(f"❌ Stopped tracking: `{parts[1]}`")
-
         elif cmd == "/resume":
             cfg.trade.enabled = True
             await send_direct_tg("🚀 Trading Engine **RESUMED**")
-
         elif cmd == "/pause":
             cfg.trade.enabled = False
             await send_direct_tg("🛑 Trading Engine **PAUSED** (Read-Only)")
-
         elif cmd == "/help":
-            help_text = (
-                "📖 **QuikPulse Guide**\n"
-                "/status - System health\n"
-                "/list - Show tracked wallets\n"
-                "/hunt - ROI Leaderboard & Audit stats\n"
-                "/pair [SYMBOL] - Monitor CEX pair\n"
-                "/rempair [SYMBOL] - Stop monitoring pair\n"
-                "/addwallet [ADDR] - Track DEX address\n"
-                "/remwallet [ADDR] - Stop tracking address\n"
-                "/resume - Start auto-trading\n"
-                "/pause - Disable auto-trading"
-            )
+            help_text = ("📖 **QuikPulse Guide**\n/status - System health\n/list - Show tracked wallets\n/hunt - ROI Leaderboard & Audit stats\n/pair [SYMBOL] - Monitor CEX pair\n/addwallet [ADDR] - Track DEX address\n/resume - Start auto-trading\n/pause - Disable auto-trading")
             await send_direct_tg(help_text)
-
         return JSONResponse({"status": "success"})
     except Exception as e:
         logger.error(f"TG Error: {e}")
@@ -710,7 +669,6 @@ async def hunting_audit_loop():
                 q = select(WalletCandidate).where(WalletCandidate.timestamp >= cutoff).where(WalletCandidate.is_win == 0)
                 res = await session_db.execute(q)
                 candidates = res.scalars().all()
-
                 for c in candidates:
                     try:
                         curr = await generator.dex.get_price_data(c.token_mint)
@@ -718,22 +676,13 @@ async def hunting_audit_loop():
                             c.is_win = 1
                             logger.info(f"Hunter: Candidate {c.address[:6]} hit profit target.")
                     except: continue
-
                 await session_db.commit()
-
-                consistency_query = (
-                    select(WalletCandidate.address, func.count(WalletCandidate.id))
-                    .where(WalletCandidate.is_win == 1)
-                    .group_by(WalletCandidate.address)
-                    .having(func.count(WalletCandidate.id) >= cfg.min_hunter_wins_required)
-                )
+                consistency_query = (select(WalletCandidate.address, func.count(WalletCandidate.id)).where(WalletCandidate.is_win == 1).group_by(WalletCandidate.address).having(func.count(WalletCandidate.id) >= cfg.min_hunter_wins_required))
                 winners = await session_db.execute(consistency_query)
-
                 for addr, win_count in winners.all():
                     if addr not in store.wallet_cache:
                         await store.add_tracked_wallet(addr, label=f"Expert-Hunter-{win_count}W")
                         await send_direct_tg(f"🧬 **PRO-INSIDER HUNTED**\nWallet `{addr[:6]}` added.")
-
                 cleanup_cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
                 await session_db.execute(delete(WalletCandidate).where(WalletCandidate.timestamp < cleanup_cutoff))
                 await session_db.commit()
@@ -757,7 +706,6 @@ async def centralized_dex_watcher():
 async def background_monitor():
     while True:
         try:
-            # NEW: Cycle Heartbeat Log
             logger.info(f"🔄 Starting CEX Polling Cycle for {len(cfg.symbols)} pairs...")
             for s in list(cfg.symbols):
                 await generator.generate_cex_signal(s)
@@ -771,17 +719,11 @@ async def wallet_refresh_loop():
         await store.refresh_wallet_cache()
 
 async def notify_new_signal(sig, session, cfg, is_whale=False, is_sniper=False, is_squeeze=False, priority=0):
-    if priority == 2:
-        prefix = "⚡ *EXPERT SNIPE*"
-    elif is_squeeze:
-        prefix = "🚨 *SQUEEZE*"
-    elif is_sniper:
-        prefix = "🎯 *SNIPER*"
-    elif is_whale:
-        prefix = "🐋 *WHALE*"
-    else:
-        prefix = "🚀 *SIGNAL*"
-        
+    if priority == 2: prefix = "⚡ *EXPERT SNIPE*"
+    elif is_squeeze: prefix = "🚨 *SQUEEZE*"
+    elif is_sniper: prefix = "🎯 *SNIPER*"
+    elif is_whale: prefix = "🐋 *WHALE*"
+    else: prefix = "🚀 *SIGNAL*"
     msg = (f"{prefix}\nPair: `{sig['symbol']}`\nAction: {sig['signal']}\nEntry: `${sig['entry']}`")
     if sig.get("sl"): msg += f"\nSL: `${sig['sl']}`"
     if sig.get("tp"): msg += f"\nTP: `${sig['tp']}`"
@@ -797,13 +739,12 @@ async def send_direct_tg(text: str):
 
 @app.get("/health")
 async def health():
-    # NEW: Enhanced Health Payload for External Monitoring
     return {
         "status": "online",
         "bot_version": cfg.model_version,
         "uptime_snapshot": str(datetime.now(timezone.utc)),
         "cex_active": len(cfg.symbols),
-        "dex_active": len(generator.active_monitors_data),
+        "dex_active": len(generator.active_monitors_data) if generator else 0,
         "db_engine": "ready" if store.engine else "not_initialized"
     }
 
