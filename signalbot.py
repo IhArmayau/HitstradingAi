@@ -414,15 +414,13 @@ class SignalGenerator:
             f_data = await self.exchange.fetch_funding_rate(symbol)
             oi_data = await self.exchange.fetch_open_interest(symbol)
             funding, oi = float(f_data.get('fundingRate', 0.0)), float(oi_data.get('openInterestAmount') or 0.0)
-            last_oi = self.prev_oi.get(symbol, 0)
-            oi_growth = (oi > last_oi * 1.05) if last_oi > 0 else False
+            last = self.prev_oi.get(symbol, 0)
+            oi_growth = (oi > last * 1.05) if last > 0 else False
             self.prev_oi[symbol] = oi
             return funding, oi, (funding < -0.01 and oi_growth)
         except: return 0.0, 0.0, False
 
     async def generate_cex_signal(self, symbol: str):
-        logger.info(f"🔍 CEX Scan: Checking {symbol} for signal conditions...")
-
         if self.cooldown_cache.get(symbol) and (datetime.now() - self.cooldown_cache[symbol]) < timedelta(minutes=self.cfg.trade.signal_cooldown_minutes):
             return
         async with self.store.get_symbol_lock(symbol):
@@ -471,39 +469,26 @@ session: Optional[aiohttp.ClientSession] = None
 generator: Optional[SignalGenerator] = None
 background_tasks = set()
 
-# PRODUCTION FIX: Background initialization to prevent Port Scan Timeout
 @app.on_event("startup")
 async def startup():
     global session, generator
-    # 1. Faster startup: Initialize Database schema only
     await store.init_db()
-
-    # 2. Run heavy loading (Exchanges, RPCs, Logic) in a non-blocking task
-    # This lets Uvicorn open the port IMMEDIATELY so Render sees it.
     asyncio.create_task(run_background_initialization())
-
     logger.info(f"🚀 QuikPulse {cfg.model_version} Port Listener Started.")
 
 async def run_background_initialization():
     global session, generator
     try:
-        logger.info("📡 Starting Background Service Initialization...")
-
-        # Load monitored pairs from DB
         async with store.async_session() as session_db:
             result = await session_db.execute(select(MonitoredPair.symbol))
             db_pairs = result.scalars().all()
             for p in db_pairs:
-                if p not in cfg.symbols:
-                    cfg.symbols.append(p)
+                if p not in cfg.symbols: cfg.symbols.append(p)
 
         session = aiohttp.ClientSession()
         sentinel = SocialSentinel(SANTIMENT_API_KEY, session)
-
-        logger.info("⚙️ Mounting Signal Generator Logic...")
         generator = SignalGenerator(cfg, store, exchange, sentinel, cluster_map, session)
 
-        # Telegram Webhook Setup
         public_url = os.getenv("RENDER_EXTERNAL_URL")
         if public_url and cfg.telegram_bot_token:
             webhook_url = f"{public_url}/tg-webhook"
@@ -511,20 +496,11 @@ async def run_background_initialization():
             async with session.get(setup_url) as resp:
                 logger.info(f"Telegram Webhook Status: {await resp.json()}")
 
-        # Start background loops
-        logger.info("📈 Launching CEX Polling Monitor...")
         background_tasks.add(asyncio.create_task(background_monitor()))
-
-        logger.info("🎯 Launching DEX Watcher (Position Tracking)...")
         background_tasks.add(asyncio.create_task(centralized_dex_watcher()))
-
-        logger.info("🧬 Launching Wallet Refresh Loop...")
         background_tasks.add(asyncio.create_task(wallet_refresh_loop()))
-
-        logger.info("🕵️ Launching Hunter Audit Engine (DEX Sniper Logic)...")
         background_tasks.add(asyncio.create_task(hunting_audit_loop()))
-
-        logger.info("✅ All background hunting engines are now LIVE and scanning.")
+        logger.info("✅ All background hunting engines are now LIVE.")
     except Exception as e:
         logger.error(f"CRITICAL: Background initialization failed: {e}")
 
@@ -534,13 +510,12 @@ async def shutdown():
     if session: await session.close()
     await exchange.close()
 
-# FIX: Added Root route to avoid "Not Found" error in browser
 @app.get("/")
 async def root():
     return {"message": "HitstradingAi is active and monitoring Solana Smart Money."}
 
-# FIX: Added route with HEAD support to fix UptimeRobot 405 errors
-@app.route("/health", methods=["GET", "HEAD"])
+# FIXED: Corrected route for FastAPI to support HEAD and GET
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health(request: Request):
     dex_count = 0
     if generator and hasattr(generator, 'active_monitors_data'):
@@ -557,8 +532,6 @@ async def health(request: Request):
 
 @app.post("/webhook")
 async def combined_webhook_handler(request: Request):
-    # Added heartbeat for incoming webhooks
-    logger.info("📡 Webhook Event Received: Incoming DEX Signal Data...")
     try:
         data = await request.json()
         db_wallets = store.wallet_cache
@@ -621,15 +594,7 @@ async def telegram_command_handler(request: Request):
 
         if cmd == "/status":
             cex_txt = ", ".join([f"`{s}`" for s in cfg.symbols]) if cfg.symbols else "None"
-            res = (
-                f"📊 **QuikPulse Dashboard**\n"
-                f"━━━━━━━━━━━━━━━\n"
-                f"🤖 **Status:** `LIVE` 🟢\n"
-                f"📈 **CEX Pairs:** {cex_txt}\n"
-                f"🎯 **DEX Active:** `{len(generator.active_monitors_data)}` tokens\n"
-                f"🧬 **Wallets:** `{len(store.wallet_cache)}` tracked\n"
-                f"━━━━━━━━━━━━━━━"
-            )
+            res = (f"📊 **QuikPulse Dashboard**\n━━━━━━━━━━━━━━━\n🤖 **Status:** `LIVE` 🟢\n📈 **CEX Pairs:** {cex_txt}\n🎯 **DEX Active:** `{len(generator.active_monitors_data)}` tokens\n🧬 **Wallets:** `{len(store.wallet_cache)}` tracked\n━━━━━━━━━━━━━━━")
             await send_direct_tg(res)
         elif cmd == "/list":
             wallets = store.wallet_cache
@@ -655,41 +620,35 @@ async def telegram_command_handler(request: Request):
                         leaderboard.append((c.address, roi, curr['symbol']))
                 leaderboard.sort(key=lambda x: x[1], reverse=True)
                 top_3 = leaderboard[:3]
-                msg = (f"🧬 **Hunter Audit Status**\n━━━━━━━━━━━━━━━\n🕵️ Candidates: `{total_c.scalar()}`\n🏆 Confirmed Wins: `{wins.scalar()}`\n\n🔥 **Top 24h Performers:**\n")
-                if not top_3: msg += "_No active performers found._"
+                msg = (f"🧬 **Hunter Audit Status**\n━━━━━━━━━━━━━━━\n🕵️ Candidates: `{total_c.scalar()}`\n🏆 Confirmed Wins: `{wins.scalar()}`\n\n🔥 **24h Performers:**\n")
+                if not top_3: msg += "_No active performers._"
                 else:
                     for i, (addr, roi, sym) in enumerate(top_3, 1):
                         msg += f"{i}. `{addr[:6]}...` | *{sym}* | **+{roi:.1f}%**\n"
-                msg += f"\n━━━━━━━━━━━━━━━\n⏱️ Window: `24h` | Mult: `{cfg.min_hunter_profit_mult}x`"
                 await send_direct_tg(msg)
-        elif cmd == "/pair":
-            if len(parts) > 1:
-                pair = parts[1].upper()
-                await exchange.load_markets()
-                if pair in exchange.markets:
-                    async with store.async_session() as session_db:
-                        await session_db.merge(MonitoredPair(symbol=pair))
-                        await session_db.commit()
-                        if pair not in cfg.symbols: cfg.symbols.append(pair)
-                        await send_direct_tg(f"✅ CEX Pair `{pair}` enabled.")
-                else: await send_direct_tg(f"❌ `{pair}` not found.")
-        elif cmd == "/addwallet":
-            if len(parts) > 1:
-                await store.add_tracked_wallet(parts[1], "Manual")
-                await send_direct_tg(f"✅ Now tracking: `{parts[1]}`")
-        elif cmd == "/remwallet":
-            if len(parts) > 1:
-                await store.remove_tracked_wallet(parts[1])
-                await send_direct_tg(f"❌ Stopped tracking: `{parts[1]}`")
+        elif cmd == "/pair" and len(parts) > 1:
+            pair = parts[1].upper()
+            await exchange.load_markets()
+            if pair in exchange.markets:
+                async with store.async_session() as session_db:
+                    await session_db.merge(MonitoredPair(symbol=pair))
+                    await session_db.commit()
+                    if pair not in cfg.symbols: cfg.symbols.append(pair)
+                    await send_direct_tg(f"✅ CEX Pair `{pair}` enabled.")
+        elif cmd == "/addwallet" and len(parts) > 1:
+            await store.add_tracked_wallet(parts[1], "Manual")
+            await send_direct_tg(f"✅ Now tracking: `{parts[1]}`")
+        elif cmd == "/remwallet" and len(parts) > 1:
+            await store.remove_tracked_wallet(parts[1])
+            await send_direct_tg(f"❌ Stopped tracking: `{parts[1]}`")
         elif cmd == "/resume":
             cfg.trade.enabled = True
             await send_direct_tg("🚀 Trading Engine **RESUMED**")
         elif cmd == "/pause":
             cfg.trade.enabled = False
-            await send_direct_tg("🛑 Trading Engine **PAUSED** (Read-Only)")
+            await send_direct_tg("🛑 Trading Engine **PAUSED**")
         elif cmd == "/help":
-            help_text = ("📖 **QuikPulse Guide**\n/status - System health\n/list - Show tracked wallets\n/hunt - ROI Leaderboard & Audit stats\n/pair [SYMBOL] - Monitor CEX pair\n/addwallet [ADDR] - Track DEX address\n/resume - Start auto-trading\n/pause - Disable auto-trading")
-            await send_direct_tg(help_text)
+            await send_direct_tg("📖 **QuikPulse Guide**\n/status, /list, /hunt, /pair [SYM], /addwallet [ADDR], /resume, /pause")
         return JSONResponse({"status": "success"})
     except Exception as e:
         logger.error(f"TG Error: {e}")
@@ -703,25 +662,21 @@ async def hunting_audit_loop():
                 cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
                 q = select(WalletCandidate).where(WalletCandidate.timestamp >= cutoff).where(WalletCandidate.is_win == 0)
                 res = await session_db.execute(q)
-                candidates = res.scalars().all()
-                for c in candidates:
-                    try:
-                        curr = await generator.dex.get_price_data(c.token_mint)
-                        if curr['price'] >= (c.entry_price * cfg.min_hunter_profit_mult):
-                            c.is_win = 1
-                            logger.info(f"Hunter: Candidate {c.address[:6]} hit profit target.")
-                    except: continue
+                for c in res.scalars().all():
+                    curr = await generator.dex.get_price_data(c.token_mint)
+                    if curr['price'] >= (c.entry_price * cfg.min_hunter_profit_mult):
+                        c.is_win = 1
                 await session_db.commit()
-                consistency_query = (select(WalletCandidate.address, func.count(WalletCandidate.id)).where(WalletCandidate.is_win == 1).group_by(WalletCandidate.address).having(func.count(WalletCandidate.id) >= cfg.min_hunter_wins_required))
-                winners = await session_db.execute(consistency_query)
+                consistency = (select(WalletCandidate.address, func.count(WalletCandidate.id)).where(WalletCandidate.is_win == 1).group_by(WalletCandidate.address).having(func.count(WalletCandidate.id) >= cfg.min_hunter_wins_required))
+                winners = await session_db.execute(consistency)
                 for addr, win_count in winners.all():
                     if addr not in store.wallet_cache:
                         await store.add_tracked_wallet(addr, label=f"Expert-Hunter-{win_count}W")
                         await send_direct_tg(f"🧬 **PRO-INSIDER HUNTED**\nWallet `{addr[:6]}` added.")
-                cleanup_cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
-                await session_db.execute(delete(WalletCandidate).where(WalletCandidate.timestamp < cleanup_cutoff))
+                cleanup = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+                await session_db.execute(delete(WalletCandidate).where(WalletCandidate.timestamp < cleanup))
                 await session_db.commit()
-        except Exception as e: logger.error(f"Hunter Loop Error: {e}")
+        except: await asyncio.sleep(60)
 
 async def centralized_dex_watcher():
     while True:
@@ -741,7 +696,6 @@ async def centralized_dex_watcher():
 async def background_monitor():
     while True:
         try:
-            logger.info(f"🔄 Starting CEX Polling Cycle for {len(cfg.symbols)} pairs...")
             for s in list(cfg.symbols):
                 await generator.generate_cex_signal(s)
                 await asyncio.sleep(5)
@@ -768,7 +722,6 @@ async def send_direct_tg(text: str):
     if not session or not cfg.telegram_bot_token: return
     try:
         url = f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage"
-        await asyncio.sleep(0.05)
         await request_with_retry(session, "POST", url, json={"chat_id": cfg.telegram_chat_id, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True})
     except: pass
 
