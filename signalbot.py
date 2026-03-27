@@ -80,7 +80,7 @@ class SignalModel(Base):
     model_version = Column(String)
     vol_liq_ratio = Column(Float, default=0.0)
     time_to_close = Column(Integer, nullable=True)
-    priority = Column(Integer, default=0) 
+    priority = Column(Integer, default=0)
 
 class TrackedWallet(Base):
     __tablename__ = "tracked_wallets"
@@ -112,8 +112,8 @@ class BotSetting(Base):
 # Configs & Environment
 # -----------------------------
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
-ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY", "") 
-ALCHEMY_AUTH_TOKEN = os.getenv("ALCHEMY_AUTH_TOKEN", "") 
+ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY", "")
+ALCHEMY_AUTH_TOKEN = os.getenv("ALCHEMY_AUTH_TOKEN", "")
 ALCHEMY_WEBHOOK_ID = os.getenv("ALCHEMY_WEBHOOK_ID", "")
 ALCHEMY_RPC_URL = f"https://solana-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
 SANTIMENT_API_KEY = os.getenv("SANTIMENT_API_KEY", "Eo6zp2wemnkb4cui_thgwsepbufktb4qz")
@@ -357,11 +357,11 @@ class TradeExecutor:
         if not self.cfg.trade.enabled:
             logger.info(f"🚫 [READ-ONLY] {sig['symbol']} Signal Detected.")
             return
-        
+
         pos_size = self.cfg.trade.max_position_size_usd
         if sig.get('priority') == 2:
-            pos_size = pos_size * 1.5 
-            
+            pos_size = pos_size * 1.5
+
         logger.info(f"📣 [EXECUTION] {sig['market_type']} | {sig['symbol']} | {sig['signal']} @ {sig['entry']} | Size: ${pos_size}")
 
 class SignalGenerator:
@@ -422,7 +422,7 @@ class SignalGenerator:
 
     async def generate_cex_signal(self, symbol: str):
         logger.info(f"🔍 CEX Scan: Checking {symbol} for signal conditions...")
-        
+
         if self.cooldown_cache.get(symbol) and (datetime.now() - self.cooldown_cache[symbol]) < timedelta(minutes=self.cfg.trade.signal_cooldown_minutes):
             return
         async with self.store.get_symbol_lock(symbol):
@@ -477,18 +477,18 @@ async def startup():
     global session, generator
     # 1. Faster startup: Initialize Database schema only
     await store.init_db()
-    
+
     # 2. Run heavy loading (Exchanges, RPCs, Logic) in a non-blocking task
     # This lets Uvicorn open the port IMMEDIATELY so Render sees it.
     asyncio.create_task(run_background_initialization())
-    
+
     logger.info(f"🚀 QuikPulse {cfg.model_version} Port Listener Started.")
 
 async def run_background_initialization():
     global session, generator
     try:
         logger.info("📡 Starting Background Service Initialization...")
-        
+
         # Load monitored pairs from DB
         async with store.async_session() as session_db:
             result = await session_db.execute(select(MonitoredPair.symbol))
@@ -499,7 +499,7 @@ async def run_background_initialization():
 
         session = aiohttp.ClientSession()
         sentinel = SocialSentinel(SANTIMENT_API_KEY, session)
-        
+
         logger.info("⚙️ Mounting Signal Generator Logic...")
         generator = SignalGenerator(cfg, store, exchange, sentinel, cluster_map, session)
 
@@ -514,16 +514,16 @@ async def run_background_initialization():
         # Start background loops
         logger.info("📈 Launching CEX Polling Monitor...")
         background_tasks.add(asyncio.create_task(background_monitor()))
-        
+
         logger.info("🎯 Launching DEX Watcher (Position Tracking)...")
         background_tasks.add(asyncio.create_task(centralized_dex_watcher()))
-        
+
         logger.info("🧬 Launching Wallet Refresh Loop...")
         background_tasks.add(asyncio.create_task(wallet_refresh_loop()))
-        
+
         logger.info("🕵️ Launching Hunter Audit Engine (DEX Sniper Logic)...")
         background_tasks.add(asyncio.create_task(hunting_audit_loop()))
-        
+
         logger.info("✅ All background hunting engines are now LIVE and scanning.")
     except Exception as e:
         logger.error(f"CRITICAL: Background initialization failed: {e}")
@@ -533,6 +533,27 @@ async def shutdown():
     for t in background_tasks: t.cancel()
     if session: await session.close()
     await exchange.close()
+
+# FIX: Added Root route to avoid "Not Found" error in browser
+@app.get("/")
+async def root():
+    return {"message": "HitstradingAi is active and monitoring Solana Smart Money."}
+
+# FIX: Simplified Health check to avoid crashes during startup
+@app.get("/health")
+async def health():
+    dex_count = 0
+    if generator and hasattr(generator, 'active_monitors_data'):
+        dex_count = len(generator.active_monitors_data)
+        
+    return {
+        "status": "online",
+        "bot_version": cfg.model_version,
+        "uptime_snapshot": str(datetime.now(timezone.utc)),
+        "cex_active": len(cfg.symbols),
+        "dex_active": dex_count,
+        "db_engine": "ready" if store.engine else "not_initialized"
+    }
 
 @app.post("/webhook")
 async def combined_webhook_handler(request: Request):
@@ -579,7 +600,7 @@ async def process_dex_signal(mint: str, buyer: str, is_whale: bool, is_sniper: b
     sig = {
         "timestamp": datetime.now(timezone.utc).isoformat(), "symbol": dex_data['symbol'],
         "market_type": "DEX", "contract_address": mint, "signal": "BUY", "entry": dex_data['price'],
-        "confidence": 98.0 if priority_level == 2 else 95.0, 
+        "confidence": 98.0 if priority_level == 2 else 95.0,
         "model_version": cfg.model_version, "vol_liq_ratio": safety['vl_ratio'],
         "safety_score": safety['safety_score'], "priority": priority_level
     }
@@ -750,17 +771,6 @@ async def send_direct_tg(text: str):
         await asyncio.sleep(0.05)
         await request_with_retry(session, "POST", url, json={"chat_id": cfg.telegram_chat_id, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True})
     except: pass
-
-@app.get("/health")
-async def health():
-    return {
-        "status": "online",
-        "bot_version": cfg.model_version,
-        "uptime_snapshot": str(datetime.now(timezone.utc)),
-        "cex_active": len(cfg.symbols),
-        "dex_active": len(generator.active_monitors_data) if generator else 0,
-        "db_engine": "ready" if store.engine else "not_initialized"
-    }
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
