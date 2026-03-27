@@ -539,21 +539,21 @@ async def shutdown():
 async def root():
     return {"message": "HitstradingAi is active and monitoring Solana Smart Money."}
 
-# FIX: Simplified Health check to avoid crashes during startup
-@app.get("/health")
-async def health():
+# FIX: Added route with HEAD support to fix UptimeRobot 405 errors
+@app.route("/health", methods=["GET", "HEAD"])
+async def health(request: Request):
     dex_count = 0
     if generator and hasattr(generator, 'active_monitors_data'):
         dex_count = len(generator.active_monitors_data)
-        
-    return {
+
+    return JSONResponse({
         "status": "online",
         "bot_version": cfg.model_version,
         "uptime_snapshot": str(datetime.now(timezone.utc)),
         "cex_active": len(cfg.symbols),
         "dex_active": dex_count,
         "db_engine": "ready" if store.engine else "not_initialized"
-    }
+    })
 
 @app.post("/webhook")
 async def combined_webhook_handler(request: Request):
