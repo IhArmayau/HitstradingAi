@@ -9,6 +9,7 @@ import json
 import pickle
 import sys
 import re
+import time
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Any
 from datetime import datetime, timezone, timedelta
@@ -218,15 +219,15 @@ class SignalStore:
         async with self.async_session() as session:
             await session.merge(TrackedWallet(address=address, label=label))
             await session.commit()
-        await self.refresh_wallet_cache()
-        await sync_alchemy_webhook(list(self.wallet_cache.keys()))
+            await self.refresh_wallet_cache()
+            await sync_alchemy_webhook(list(self.wallet_cache.keys()))
 
     async def remove_tracked_wallet(self, address: str):
         async with self.async_session() as session:
             await session.execute(delete(TrackedWallet).where(TrackedWallet.address == address))
             await session.commit()
-        await self.refresh_wallet_cache()
-        await sync_alchemy_webhook(list(self.wallet_cache.keys()))
+            await self.refresh_wallet_cache()
+            await sync_alchemy_webhook(list(self.wallet_cache.keys()))
 
     async def remove_cex_pair(self, symbol: str):
         async with self.async_session() as session:
@@ -423,25 +424,19 @@ class SignalGenerator:
         except: return "NEUTRAL"
 
     def _get_coinalyze_ticker(self, symbol: str):
-        """
-        FIXED: Logic to map CCXT symbol to Coinalyze Binance-Aggregated format.
-        'BTC/USDT:USDT' -> 'BTCUSDT_PERP.A'
-        """
-        # Get base and quote (e.g., BTC and USDT), stripping settlement part
-        base_quote = symbol.split(':')[0].replace('/', '').upper()
-        
-        # Use verified Binance suffix '.A'
-        suffix = os.getenv("COINALYZE_EXCHANGE_SUFFIX", ".A")
-        
-        return f"{base_quote}_PERP{suffix}"
+        base = symbol.split(':')[0].split('/')[0].upper()
+        return f"{base}USDT_PERP.A"
 
     async def fetch_coinalyze(self, endpoint, params=None):
         if not COINALYZE_API_KEY:
             return None
+        
         if params is None:
             params = {}
+            
         params['api_key'] = COINALYZE_API_KEY
         url = f"https://api.coinalyze.net/v1/{endpoint}"
+        
         try:
             async with self.session.get(url, params=params) as resp:
                 if resp.status == 429:
@@ -462,9 +457,9 @@ class SignalGenerator:
     async def analyze_funding_squeeze(self, symbol: str):
         try:
             c_ticker = self._get_coinalyze_ticker(symbol)
-            params = {"symbols": [c_ticker]}
-            logger.info(f"📡 Coinalyze Analytics → {c_ticker} | Params: {params}")
-
+            # Use fixed string format to avoid 404
+            params = {"symbols": c_ticker} 
+            
             # 1. Fetch Aggregated Funding Rate
             funding_data = await self.fetch_coinalyze("funding-rate", params)
             funding = float(funding_data[0]['value']) if (funding_data and len(funding_data) > 0) else 0.0
@@ -479,31 +474,37 @@ class SignalGenerator:
                 oi_growth = (oi > last * 1.05) if last > 0 else False
                 self.prev_oi[symbol] = oi
 
-            # 3. Fetch Aggregated Liquidations (Last 3 hours)
-            liquidations_buy = 0.0
-            liquidations_sell = 0.0
-            liq_params = params.copy()
-            liq_params.update({
-                "interval": "1hour",
-                "from": int((datetime.now() - timedelta(hours=3)).timestamp()),
-                "to": int(datetime.now().timestamp())
-            })
-
-            liq_data = await self.fetch_coinalyze("liquidations", liq_params)
+            # 3. Fetch Aggregated Liquidations (Using Verified liquidation-history endpoint)
+            liquidations_long = 0.0
+            liquidations_short = 0.0
+            
+            now = int(time.time())
+            lookback = now - 10800 # 3 hours
+            
+            liq_params = {
+                "symbols": c_ticker,
+                "interval": "1min",
+                "from": lookback,
+                "to": now,
+                "convert_to_usd": "true"
+            }
+            
+            liq_data = await self.fetch_coinalyze("liquidation-history", liq_params)
+            
             if liq_data and len(liq_data) > 0:
-                history = liq_data[0].get('data', [])
+                history = liq_data[0].get('history', [])
                 for item in history:
-                    liquidations_buy += float(item.get('buy_volume', 0))
-                    liquidations_sell += float(item.get('sell_volume', 0))
+                    liquidations_long += float(item.get('l', 0))
+                    liquidations_short += float(item.get('s', 0))
 
             # Smart Money Logic: Trapped Shorts + OI Growth + Heavy Sell Liquidations
             is_squeeze = (
-                funding < -0.01 and
-                oi_growth and
-                liquidations_sell > (liquidations_buy * 1.5)
+                funding < -0.01 and 
+                oi_growth and 
+                liquidations_short > (liquidations_long * 1.5)
             )
-
-            return funding, oi, is_squeeze, liquidations_buy, liquidations_sell
+            
+            return funding, oi, is_squeeze, liquidations_long, liquidations_short
         except Exception as e:
             logger.error(f"Coinalyze Analytics Error for {symbol}: {e}")
             return 0.0, 0.0, False, 0.0, 0.0
@@ -514,7 +515,7 @@ class SignalGenerator:
         async with self.store.get_symbol_lock(symbol):
             try:
                 market_bias = await self.get_market_sentiment_index()
-                funding, oi, is_squeeze, liq_buy, liq_sell = await self.analyze_funding_squeeze(symbol)
+                funding, oi, is_squeeze, liq_long, liq_short = await self.analyze_funding_squeeze(symbol)
 
                 ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=self.cfg.timeframe, limit=100)
                 df = pd.DataFrame(ohlcv, columns=["ts", "o", "h", "l", "c", "v"])
@@ -522,14 +523,13 @@ class SignalGenerator:
                 df['adx'] = ta.trend.ADXIndicator(df['h'], df['l'], df['c']).adx()
                 current_adx = df['adx'].iloc[-1]
 
-                logger.info(f"📊 {symbol} Audit -> ADX: {current_adx:.2f} | OI: {oi:.0f} | Funding: {funding*100:.4f}% | Liq(B/S): {liq_buy:.0f}/{liq_sell:.0f}")
+                logger.info(f"📊 {symbol} Audit -> ADX: {current_adx:.2f} | OI: {oi:.0f} | Funding: {funding*100:.4f}% | Liq(L/S): {liq_long:.0f}/{liq_short:.0f}")
 
                 if current_adx < self.cfg.indicators.adx_threshold:
                     return
 
                 df['ema_s'], df['ema_m'] = df['c'].ewm(span=self.cfg.indicators.ema_short).mean(), df['c'].ewm(span=self.cfg.indicators.ema_medium).mean()
                 df['atr'] = ta.volatility.AverageTrueRange(df['h'], df['l'], df['c']).average_true_range()
-
                 last = df.iloc[-1]
 
                 stype = "BUY" if last['ema_s'] > last['ema_m'] else "SELL" if last['ema_s'] < last['ema_m'] else None
@@ -543,6 +543,7 @@ class SignalGenerator:
                         return
 
                     social = await self.sentinel.get_sentiment(symbol)
+
                     entry_price = float(last['c'])
                     sl = entry_price - (last['atr'] * self.cfg.indicators.atr_sl_mult) if stype == "BUY" else entry_price + (last['atr'] * self.cfg.indicators.atr_sl_mult)
                     tp = entry_price + (last['atr'] * self.cfg.indicators.atr_tp_mult) if stype == "BUY" else entry_price - (last['atr'] * self.cfg.indicators.atr_tp_mult)
@@ -558,7 +559,7 @@ class SignalGenerator:
                     await self.store.insert_signal(sig)
                     self.cooldown_cache[symbol] = datetime.now()
                     await self.executor.execute_trade(sig)
-                    await notify_new_signal(sig, self.session, self.cfg, is_squeeze=is_squeeze, liq_info=(liq_buy, liq_sell))
+                    await notify_new_signal(sig, self.session, self.cfg, is_squeeze=is_squeeze, liq_info=(liq_long, liq_short))
 
             except Exception as e:
                 logger.error(f"CEX Logic Error for {symbol}: {e}")
@@ -783,7 +784,6 @@ async def telegram_command_handler(request: Request):
                 for i, (addr, label) in enumerate(wallets.items(), 1):
                     msg += f"{i}. `{addr}`\n   └ Label: *{label}*\n"
                 await send_direct_tg(msg)
-
         elif cmd == "/hunt":
             async with store.async_session() as session_db:
                 total_c = await session_db.execute(select(func.count(WalletCandidate.id)))
@@ -806,7 +806,6 @@ async def telegram_command_handler(request: Request):
                     for i, (addr, roi, sym) in enumerate(top_3, 1):
                         msg += f"{i}. `{addr[:6]}...` | *{sym}* | **+{roi:.1f}%**\n"
                 await send_direct_tg(msg)
-
         elif cmd == "/pair" and len(parts) > 1:
             pair = parts[1].upper()
             await exchange.load_markets()
@@ -814,28 +813,22 @@ async def telegram_command_handler(request: Request):
                 async with store.async_session() as session_db:
                     await session_db.merge(MonitoredPair(symbol=pair))
                     await session_db.commit()
-                if pair not in cfg.symbols: cfg.symbols.append(pair)
-                await send_direct_tg(f"✅ CEX Pair `{pair}` enabled.")
-
+                    if pair not in cfg.symbols: cfg.symbols.append(pair)
+                    await send_direct_tg(f"✅ CEX Pair `{pair}` enabled.")
         elif cmd == "/addwallet" and len(parts) > 1:
             await store.add_tracked_wallet(parts[1], "Manual")
             await send_direct_tg(f"✅ Now tracking: `{parts[1]}`")
-
         elif cmd == "/remwallet" and len(parts) > 1:
             await store.remove_tracked_wallet(parts[1])
             await send_direct_tg(f"❌ Stopped tracking: `{parts[1]}`")
-
         elif cmd == "/resume":
             cfg.trade.enabled = True
             await send_direct_tg("🚀 Trading Engine **RESUMED**")
-
         elif cmd == "/pause":
             cfg.trade.enabled = False
             await send_direct_tg("🛑 Trading Engine **PAUSED**")
-
         elif cmd == "/help":
             await send_direct_tg("📖 **QuikPulse Guide**\n/status, /balance, /top, /config [adx/tp/sl/liq], /logs, /clearlogs, /list, /hunt, /pair [SYM], /addwallet [ADDR], /resume, /pause")
-
         return JSONResponse({"status": "ok"})
     except Exception as e:
         logger.error(f"TG Error: {e}")
@@ -854,14 +847,12 @@ async def hunting_audit_loop():
                     if curr['price'] >= (c.entry_price * cfg.min_hunter_profit_mult):
                         c.is_win = 1
                 await session_db.commit()
-
                 consistency = (select(WalletCandidate.address, func.count(WalletCandidate.id)).where(WalletCandidate.is_win == 1).group_by(WalletCandidate.address).having(func.count(WalletCandidate.id) >= cfg.min_hunter_wins_required))
                 winners = await session_db.execute(consistency)
                 for addr, win_count in winners.all():
                     if addr not in store.wallet_cache:
                         await store.add_tracked_wallet(addr, label=f"Expert-Hunter-{win_count}W")
                         await send_direct_tg(f"🧬 **PRO-INSIDER HUNTED**\nWallet `{addr[:6]}` added.")
-
                 cleanup = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
                 await session_db.execute(delete(WalletCandidate).where(WalletCandidate.timestamp < cleanup))
                 await session_db.commit()
@@ -915,10 +906,10 @@ async def notify_new_signal(sig, session, cfg, is_whale=False, is_sniper=False, 
 
     if sig.get('funding') or sig.get('open_interest'):
         msg += f"\n📊 Aggregated OI: `{sig['open_interest']:.0f}` | Funding: `{sig['funding']*100:.4f}%`"
-
+    
     if liq_info:
-        buy_liq, sell_liq = liq_info
-        msg += f"\n💥 3h Liquidation(B/S): `${buy_liq:,.0f}` / `${sell_liq:,.0f}`"
+        long_liq, short_liq = liq_info
+        msg += f"\n💥 3h Liquidation(L/S): `${long_liq:,.0f}` / `${short_liq:,.0f}`"
 
     await send_direct_tg(msg)
 
