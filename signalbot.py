@@ -162,7 +162,7 @@ class BotConfig:
     telegram_bot_token: Optional[str] = os.getenv("TELEGRAM_BOT_TOKEN")
     telegram_chat_id: Optional[str] = os.getenv("TELEGRAM_CHAT_ID")
     solana_wallet_address: Optional[str] = os.getenv("SOLANA_WALLET_ADDRESS")
-    model_version: str = "v7.9.8-production"
+    model_version: str = "v7.9.9-conviction"
 
 # -----------------------------
 # Utility: API Resilience
@@ -424,8 +424,6 @@ class SignalGenerator:
             markets = await self.exchange.fetch_markets()
             for m in markets:
                 if m['symbol'] == ccxt_symbol:
-                    # 'id' is the raw string like 'XBTUSDTM'
-                    # 'info' contains the 'multiplier' field from the exchange API
                     multiplier = float(m['info'].get('multiplier', 1.0))
                     return m['id'], multiplier
         except Exception as e:
@@ -434,30 +432,47 @@ class SignalGenerator:
 
     async def analyze_funding_squeeze(self, symbol: str):
         funding, oi, is_squeeze = 0.0, 0.0, False
+        conviction_score = 0
         try:
             # 1. Fetch Funding Rate
             f_data = await self.exchange.fetch_funding_rate(symbol)
             funding = float(f_data.get('fundingRate', 0.0))
             
             # 2. Fetch OI with dynamic ID mapping
-            kucoin_id, multiplier = await self.get_kucoin_id(symbol)
-            if kucoin_id:
-                # Use standard fetch_open_interest if available, or raw params
-                oi_response = await self.exchange.futures_public_get_open_interest({'symbol': kucoin_id})
-                raw_oi = float(oi_response.get('data', {}).get('openInterest', 0.0))
-                oi = raw_oi * multiplier
-                
+            # FIX: Switched to fetch_open_interest (Unified Method) to prevent AttributeErrors
+            try:
+                oi_data = await self.exchange.fetch_open_interest(symbol)
+                oi = float(oi_data.get('openInterestAmount', oi_data.get('baseVolume', 0.0)))
+            except Exception as e:
+                logger.warning(f"Unified OI fetch failed for {symbol}, trying fallback: {e}")
+                kucoin_id, multiplier = await self.get_kucoin_id(symbol)
+                if kucoin_id:
+                    # Using the correct implicit call name for newer CCXT versions
+                    oi_response = await self.exchange.publicGetMarketOpenInterest({'symbol': kucoin_id})
+                    raw_oi = float(oi_response.get('data', {}).get('size', 0.0))
+                    oi = raw_oi * multiplier
+            
+            if oi > 0:
                 last = self.prev_oi.get(symbol, 0)
                 oi_growth = (oi > last * 1.05) if last > 0 else False
                 self.prev_oi[symbol] = oi
                 is_squeeze = (funding < -0.01 and oi_growth)
-            else:
-                logger.debug(f"Could not map KuCoin ID for {symbol}")
             
-            return funding, oi, is_squeeze
+            # 3. PROXY CONVICTION LOGIC
+            ohlcv_conv = await self.exchange.fetch_ohlcv(symbol, timeframe='5m', limit=3)
+            if len(ohlcv_conv) >= 2:
+                curr_vol = ohlcv_conv[-1][5]
+                prev_vol = ohlcv_conv[-2][5]
+                vol_rising = curr_vol > prev_vol
+                funding_aggressive = abs(funding) > 0.0001 # 0.01%
+                
+                if vol_rising and funding_aggressive:
+                    conviction_score = 1 
+
+            return funding, oi, is_squeeze, conviction_score
         except Exception as e:
             logger.error(f"Funding/OI analysis failed for {symbol}: {e}")
-            return 0.0, 0.0, False
+            return 0.0, 0.0, False, 0
 
     async def generate_cex_signal(self, symbol: str):
         if self.cooldown_cache.get(symbol) and (datetime.now() - self.cooldown_cache[symbol]) < timedelta(minutes=self.cfg.trade.signal_cooldown_minutes):
@@ -465,7 +480,7 @@ class SignalGenerator:
         async with self.store.get_symbol_lock(symbol):
             try:
                 market_bias = await self.get_market_sentiment_index()
-                funding, oi, is_squeeze = await self.analyze_funding_squeeze(symbol)
+                funding, oi, is_squeeze, conviction = await self.analyze_funding_squeeze(symbol)
                 
                 ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=self.cfg.timeframe, limit=100)
                 df = pd.DataFrame(ohlcv, columns=["ts", "o", "h", "l", "c", "v"])
@@ -473,7 +488,7 @@ class SignalGenerator:
                 df['adx'] = ta.trend.ADXIndicator(df['h'], df['l'], df['c']).adx()
                 current_adx = df['adx'].iloc[-1]
                 
-                logger.info(f"📊 {symbol} Audit -> ADX: {current_adx:.2f} | OI: {oi:.0f} | Funding: {funding*100:.4f}%")
+                logger.info(f"📊 {symbol} Audit -> ADX: {current_adx:.2f} | OI: {oi:.0f} | Conviction: {conviction}")
                 
                 if current_adx < self.cfg.indicators.adx_threshold: 
                     return
@@ -485,6 +500,10 @@ class SignalGenerator:
                 stype = "BUY" if last['ema_s'] > last['ema_m'] else "SELL" if last['ema_s'] < last['ema_m'] else None
 
                 if stype and not await self.store.has_open_signal(symbol):
+                    if oi <= 0 and conviction == 0:
+                        logger.info(f"🚫 {symbol} {stype} rejected: No OI data and low Conviction score.")
+                        return
+
                     if stype == "BUY" and market_bias == "BEARISH" and not is_squeeze: 
                         logger.info(f"🚫 {symbol} BUY rejected: Market Bias is BEARISH")
                         return
@@ -529,7 +548,6 @@ background_tasks = set()
 @app.on_event("startup")
 async def startup():
     global session, generator
-    # Ensure directory exists for model
     Path("models").mkdir(exist_ok=True)
     await store.init_db()
     asyncio.create_task(run_background_initialization())
@@ -590,7 +608,6 @@ async def health(request: Request):
 
 @app.post("/webhook")
 async def combined_webhook_handler(request: Request):
-    logger.info("🔔 WEBHOOK ROUTE TRIGGERED")
     try:
         data = await request.json()
         db_wallets = store.wallet_cache
