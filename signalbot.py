@@ -423,7 +423,7 @@ class SignalGenerator:
         except: return "NEUTRAL"
 
     def _get_coinalyze_ticker(self, symbol: str):
-        # Cleans 'BTC/USDT:USDT' -> 'BTCUSDT_PERP.A'
+        # Cleans 'ETH/USDT:USDT' -> 'ETHUSDT_PERP.A'
         base = symbol.split('/')[0].upper()
         return f"{base}USDT_PERP.A"
 
@@ -446,6 +446,7 @@ class SignalGenerator:
                     return await self.fetch_coinalyze(endpoint, params)
                 if resp.status == 200:
                     data = await resp.json()
+                    # Coinalyze returns a list of objects, we return the list
                     return data if data else None
                 else:
                     text = await resp.text()
@@ -460,6 +461,7 @@ class SignalGenerator:
             
             # 1. Fetch Aggregated Funding Rate
             funding_data = await self.fetch_coinalyze("predicted-funding-rate", {"symbols": c_ticker})
+            # funding_data is a list: [{'symbol': '...', 'value': 0.0001}]
             funding = float(funding_data[0]['value']) if (funding_data and len(funding_data) > 0) else 0.0
 
             # 2. Fetch Aggregated Open Interest
@@ -482,8 +484,11 @@ class SignalGenerator:
                 "to": int(datetime.now().timestamp())
             })
             
+            # liq_data is a list of historical snapshots
             if liq_data and len(liq_data) > 0:
-                for item in liq_data:
+                # The data is nested: liq_data[0]['history'] contains the actual list
+                history = liq_data[0].get('history', [])
+                for item in history:
                     liquidations_buy += float(item.get('buy_vol', 0))
                     liquidations_sell += float(item.get('sell_vol', 0))
 
