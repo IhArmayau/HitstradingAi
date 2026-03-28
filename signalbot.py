@@ -387,6 +387,8 @@ class SignalGenerator:
         self.cooldown_cache = {}
         self.prev_oi = {}
         self.ml_model = self._load_model()
+        # Initialized in run_background_initialization
+        self.data_exchange: Optional[ccxt.Exchange] = None
 
     def _load_model(self):
         path = self.cfg.ml_model_path
@@ -430,30 +432,31 @@ class SignalGenerator:
 
     async def analyze_funding_squeeze(self, symbol: str):
         try:
+            # Execution Exchange (KuCoin) handles Funding Rate
             f_data = await self.exchange.fetch_funding_rate(symbol)
             funding = float(f_data.get('fundingRate', 0.0))
 
             oi = 0.0
             oi_growth = False
+            
+            # Use Bybit as the primary Data Exchange for Open Interest
+            # If Bybit isn't initialized yet, fallback to execution exchange
+            data_source = self.data_exchange if self.data_exchange else self.exchange
+            
             try:
-                if 'kucoin' in str(self.exchange.id).lower():
-                    # FIX: Corrected implicit method call for KuCoin Futures
-                    ticker = self._get_kucoin_ticker(symbol)
-                    oi_data = await self.exchange.futuresPublicGetOpenInterest({'symbol': ticker})
-                    oi = float(oi_data.get('data', {}).get('openInterest', 0.0))
-                else:
-                    oi_data = await self.exchange.fetch_open_interest(symbol)
-                    oi = float(oi_data.get('openInterestAmount') or 0.0)
+                # CCXT Unified method handles all symbol mapping and nested 'data' objects
+                oi_data = await data_source.fetch_open_interest(symbol)
+                oi = float(oi_data.get('openInterestAmount') or oi_data.get('openInterest') or 0.0)
 
                 last = self.prev_oi.get(symbol, 0)
                 oi_growth = (oi > last * 1.05) if last > 0 else False
                 self.prev_oi[symbol] = oi
             except Exception as e:
-                logger.debug(f"OI Sub-fetch error for {symbol}: {e}")
+                logger.debug(f"OI Sub-fetch error via {data_source.id} for {symbol}: {e}")
 
             return funding, oi, (funding < -0.01 and oi_growth)
         except Exception as e:
-            logger.error(f"Funding Fetch Error for {symbol}: {e}")
+            logger.error(f"Funding/OI Fetch Error for {symbol}: {e}")
             return 0.0, 0.0, False
 
     async def generate_cex_signal(self, symbol: str):
@@ -520,6 +523,9 @@ cfg = BotConfig()
 store = SignalStore(DATABASE_URL)
 cluster_map = ClusterEngine(cfg.cluster_window_minutes)
 exchange = ccxt.kucoinfutures({"enableRateLimit": True})
+# Secondary exchange for reliable market data
+data_exchange = ccxt.bybit({"enableRateLimit": True})
+
 session: Optional[aiohttp.ClientSession] = None
 generator: Optional[SignalGenerator] = None
 background_tasks = set()
@@ -543,6 +549,9 @@ async def run_background_initialization():
         session = aiohttp.ClientSession()
         sentinel = SocialSentinel(SANTIMENT_API_KEY, session)
         generator = SignalGenerator(cfg, store, exchange, sentinel, cluster_map, session)
+        
+        # Link Bybit as the dedicated data source
+        generator.data_exchange = data_exchange
 
         public_url = os.getenv("RENDER_EXTERNAL_URL")
         if public_url and cfg.telegram_bot_token:
@@ -564,6 +573,7 @@ async def shutdown():
     for t in background_tasks: t.cancel()
     if session: await session.close()
     await exchange.close()
+    await data_exchange.close()
 
 @app.get("/")
 async def root():
