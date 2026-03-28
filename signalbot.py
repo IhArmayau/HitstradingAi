@@ -419,15 +419,15 @@ class SignalGenerator:
         except: return "NEUTRAL"
 
     async def get_kucoin_id(self, ccxt_symbol: str):
-        """Fetches the actual KuCoin contract ID and multiplier to ensure non-zero OI."""
+        """Standardized fetch_markets approach for stable KuCoin contract ID lookup."""
         try:
-            response = await self.exchange.futures_public_get_contracts_active()
-            contracts = response.get('data', [])
-            base = ccxt_symbol.split('/')[0].upper()
-            if base == "BTC": base = "XBT" 
-            for contract in contracts:
-                if contract['baseCurrency'] == base and contract['quoteCurrency'] == 'USDT':
-                    return contract['symbol'], float(contract.get('multiplier', 1.0))
+            markets = await self.exchange.fetch_markets()
+            for m in markets:
+                if m['symbol'] == ccxt_symbol:
+                    # 'id' is the raw string like 'XBTUSDTM'
+                    # 'info' contains the 'multiplier' field from the exchange API
+                    multiplier = float(m['info'].get('multiplier', 1.0))
+                    return m['id'], multiplier
         except Exception as e:
             logger.error(f"❌ KuCoin ID Lookup failed: {e}")
         return None, 1.0
@@ -442,6 +442,7 @@ class SignalGenerator:
             # 2. Fetch OI with dynamic ID mapping
             kucoin_id, multiplier = await self.get_kucoin_id(symbol)
             if kucoin_id:
+                # Use standard fetch_open_interest if available, or raw params
                 oi_response = await self.exchange.futures_public_get_open_interest({'symbol': kucoin_id})
                 raw_oi = float(oi_response.get('data', {}).get('openInterest', 0.0))
                 oi = raw_oi * multiplier
