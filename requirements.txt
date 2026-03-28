@@ -1,17 +1,18 @@
 --prefer-binary
 
-# Core Web & API (FastAPI)
+# Core Web & API
 fastapi
 uvicorn
 jinja2
 python-multipart
 aiohttp
 
-# Database & Storage (PostgreSQL + SQLAlchemy)
-sqlalchemy
+# Database & Storage
+sqlalchemy>=2.0.0
 asyncpg
 psycopg2-binary
 cloudinary
+greenlet  # <--- Add this for SQLAlchemy async support
 
 # Trading & Logic Engine
 ccxt

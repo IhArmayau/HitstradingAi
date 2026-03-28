@@ -14,6 +14,7 @@ from typing import List, Dict, Optional, Any
 from datetime import datetime, timezone, timedelta
 import numpy as np
 import aiohttp
+import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.templating import Jinja2Templates
@@ -119,6 +120,7 @@ ALCHEMY_AUTH_TOKEN = os.getenv("ALCHEMY_AUTH_TOKEN", "")
 ALCHEMY_WEBHOOK_ID = os.getenv("ALCHEMY_WEBHOOK_ID", "")
 ALCHEMY_RPC_URL = f"https://solana-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
 SANTIMENT_API_KEY = os.getenv("SANTIMENT_API_KEY", "Eo6zp2wemnkb4cui_thgwsepbufktb4qz")
+COINALYZE_API_KEY = os.getenv("COINALYZE_API_KEY")
 
 if SANTIMENT_API_KEY:
     san.ApiConfig.api_key = SANTIMENT_API_KEY
@@ -162,7 +164,7 @@ class BotConfig:
     telegram_bot_token: Optional[str] = os.getenv("TELEGRAM_BOT_TOKEN")
     telegram_chat_id: Optional[str] = os.getenv("TELEGRAM_CHAT_ID")
     solana_wallet_address: Optional[str] = os.getenv("SOLANA_WALLET_ADDRESS")
-    model_version: str = "v7.9.7-production"
+    model_version: str = "v7.9.9-production"
 
 # -----------------------------
 # Utility: API Resilience
@@ -274,7 +276,6 @@ class SignalStore:
 # -----------------------------
 async def sync_alchemy_webhook(addresses: List[str]):
     if not ALCHEMY_AUTH_TOKEN or not ALCHEMY_WEBHOOK_ID: return
-    # Optimization: Filter to only tracked wallets to save credits
     url = f"https://dashboard.alchemy.com/api/update-webhook-addresses"
     headers = {"X-Alchemy-Token": ALCHEMY_AUTH_TOKEN, "Content-Type": "application/json"}
     payload = {"webhook_id": ALCHEMY_WEBHOOK_ID, "addresses_to_add": addresses, "addresses_to_remove": []}
@@ -350,7 +351,6 @@ class ClusterEngine:
 class SecurityEngine:
     async def get_safety_report(self, address: str, vol_24h: float, liq: float, min_liq: float = 10000.0) -> Dict[str, Any]:
         vl_ratio = vol_24h / liq if liq > 0 else 0.0
-        # Check Liquidity Threshold
         is_safe_liquidity = liq >= min_liq
         safety_score = 80 if (0 < vl_ratio < 5 and is_safe_liquidity) else 40
         return {
@@ -422,43 +422,69 @@ class SignalGenerator:
             return "NEUTRAL"
         except: return "NEUTRAL"
 
-    def _get_kucoin_ticker(self, symbol: str):
-        # Maps 'BTC/USDT:USDT' -> 'XBTUSDTM'
-        # Maps 'ETH/USDT:USDT' -> 'ETHUSDTM'
+    def _get_coinalyze_ticker(self, symbol: str):
         base = symbol.split('/')[0]
-        if base == 'BTC': base = 'XBT'
-        return f"{base}USDTM"
+        return f"{base}USDT_PERP"
+
+    async def fetch_coinalyze(self, endpoint, params=None):
+        if not COINALYZE_API_KEY:
+            return None
+        url = f"https://api.coinalyze.net/v1/{endpoint}"
+        headers = {"api_key": COINALYZE_API_KEY}
+        
+        try:
+            async with self.session.get(url, headers=headers, params=params) as resp:
+                if resp.status == 429:
+                    wait = int(resp.headers.get("Retry-After", 10))
+                    logger.warning(f"Coinalyze 429. Waiting {wait}s...")
+                    await asyncio.sleep(wait)
+                    return await self.fetch_coinalyze(endpoint, params)
+                if resp.status == 200:
+                    return await resp.json()
+        except Exception as e:
+            logger.error(f"Coinalyze request error: {e}")
+        return None
 
     async def analyze_funding_squeeze(self, symbol: str):
         try:
-            f_data = await self.exchange.fetch_funding_rate(symbol)
-            funding = float(f_data.get('fundingRate', 0.0))
+            c_ticker = self._get_coinalyze_ticker(symbol)
+            
+            # 1. Fetch Aggregated Funding Rate
+            funding_data = await self.fetch_coinalyze("predicted-funding-rate", {"symbols": c_ticker})
+            funding = float(funding_data[0]['value']) if funding_data else 0.0
 
+            # 2. Fetch Aggregated Open Interest
             oi = 0.0
             oi_growth = False
-            try:
-                if 'kucoin' in str(self.exchange.id).lower():
-                    ticker = self._get_kucoin_ticker(symbol)
-                    # Use implicit method - KuCoin response: {'code': '200000', 'data': {'openInterest': '123.45', ...}}
-                    oi_data = await self.exchange.futures_public_get_open_interest({'symbol': ticker})
-                    
-                    # KuCoin returns values as Strings in a nested 'data' object
-                    raw_val = oi_data.get('data', {}).get('openInterest', '0')
-                    oi = float(raw_val) if raw_val else 0.0
-                else:
-                    oi_data = await self.exchange.fetch_open_interest(symbol)
-                    oi = float(oi_data.get('openInterestAmount') or 0.0)
-
+            oi_data = await self.fetch_coinalyze("current-open-interest", {"symbols": c_ticker})
+            if oi_data:
+                oi = float(oi_data[0]['value'])
                 last = self.prev_oi.get(symbol, 0)
                 oi_growth = (oi > last * 1.05) if last > 0 else False
                 self.prev_oi[symbol] = oi
-            except Exception as e:
-                logger.debug(f"OI Sub-fetch error for {symbol}: {e}")
 
-            return funding, oi, (funding < -0.01 and oi_growth)
+            # 3. Fetch Aggregated Liquidations (Last 3 hours)
+            liquidations_buy = 0.0
+            liquidations_sell = 0.0
+            liq_data = await self.fetch_coinalyze("liquidation-history", {
+                "symbols": c_ticker,
+                "interval": "1hour",
+                "from": int((datetime.now() - timedelta(hours=3)).timestamp()),
+                "to": int(datetime.now().timestamp())
+            })
+            
+            if liq_data and len(liq_data) > 0:
+                # Summing recent liquidations
+                liquidations_buy = sum(float(item['buy_vol']) for item in liq_data)
+                liquidations_sell = sum(float(item['sell_vol']) for item in liq_data)
+
+            # Squeeze logic: Negative funding + Rising OI + Significant Sell (Long) Liquidations
+            is_squeeze = (funding < -0.01 and oi_growth and liquidations_sell > 0)
+
+            return funding, oi, is_squeeze, liquidations_buy, liquidations_sell
         except Exception as e:
-            logger.error(f"Funding Fetch Error for {symbol}: {e}")
-            return 0.0, 0.0, False
+            logger.error(f"Coinalyze Analytics Error for {symbol}: {e}")
+            return 0.0, 0.0, False, 0.0, 0.0
 
     async def generate_cex_signal(self, symbol: str):
         if self.cooldown_cache.get(symbol) and (datetime.now() - self.cooldown_cache[symbol]) < timedelta(minutes=self.cfg.trade.signal_cooldown_minutes):
@@ -466,7 +492,7 @@ class SignalGenerator:
         async with self.store.get_symbol_lock(symbol):
             try:
                 market_bias = await self.get_market_sentiment_index()
-                funding, oi, is_squeeze = await self.analyze_funding_squeeze(symbol)
+                funding, oi, is_squeeze, liq_buy, liq_sell = await self.analyze_funding_squeeze(symbol)
 
                 ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=self.cfg.timeframe, limit=100)
                 df = pd.DataFrame(ohlcv, columns=["ts", "o", "h", "l", "c", "v"])
@@ -474,7 +500,7 @@ class SignalGenerator:
                 df['adx'] = ta.trend.ADXIndicator(df['h'], df['l'], df['c']).adx()
                 current_adx = df['adx'].iloc[-1]
 
-                logger.info(f"📊 {symbol} Audit -> ADX: {current_adx:.2f} | OI: {oi:.0f} | Funding: {funding*100:.4f}%")
+                logger.info(f"📊 {symbol} Audit -> ADX: {current_adx:.2f} | OI: {oi:.0f} | Funding: {funding*100:.4f}% | Liq(B/S): {liq_buy:.0f}/{liq_sell:.0f}")
 
                 if current_adx < self.cfg.indicators.adx_threshold:
                     return
@@ -510,7 +536,7 @@ class SignalGenerator:
                     await self.store.insert_signal(sig)
                     self.cooldown_cache[symbol] = datetime.now()
                     await self.executor.execute_trade(sig)
-                    await notify_new_signal(sig, self.session, self.cfg, is_squeeze=is_squeeze)
+                    await notify_new_signal(sig, self.session, self.cfg, is_squeeze=is_squeeze, liq_info=(liq_buy, liq_sell))
 
             except Exception as e:
                 logger.error(f"CEX Logic Error for {symbol}: {e}")
@@ -639,7 +665,6 @@ async def process_dex_signal(mint: str, buyer: str, is_whale: bool, is_sniper: b
     dex_data = await generator.dex.get_price_data(mint)
     if dex_data['price'] <= 0: return
 
-    # Apply Liquidity Filter
     safety = await generator.security.get_safety_report(mint, dex_data['vol24'], dex_data['liq'], cfg.trade.min_liquidity_usd)
     if safety['is_rugged']:
         logger.info(f"🚫 Skipped {dex_data['symbol']} due to low liquidity (${dex_data['liq']})")
@@ -845,7 +870,7 @@ async def wallet_refresh_loop():
         await asyncio.sleep(1800)
         await store.refresh_wallet_cache()
 
-async def notify_new_signal(sig, session, cfg, is_whale=False, is_sniper=False, is_squeeze=False, priority=0):
+async def notify_new_signal(sig, session, cfg, is_whale=False, is_sniper=False, is_squeeze=False, priority=0, liq_info=None):
     if priority == 2: prefix = "⚡ *EXPERT SNIPE*"
     elif is_squeeze: prefix = "🚨 *SQUEEZE*"
     elif is_sniper: prefix = "🎯 *SNIPER*"
@@ -857,7 +882,11 @@ async def notify_new_signal(sig, session, cfg, is_whale=False, is_sniper=False, 
     if sig.get("tp"): msg += f"\nTP: `${sig['tp']}`"
 
     if sig.get('funding') or sig.get('open_interest'):
-        msg += f"\n📊 OI: `{sig['open_interest']:.0f}` | Funding: `{sig['funding']*100:.4f}%`"
+        msg += f"\n📊 Aggregated OI: `{sig['open_interest']:.0f}` | Funding: `{sig['funding']*100:.4f}%`"
+    
+    if liq_info:
+        buy_liq, sell_liq = liq_info
+        msg += f"\n💥 3h Liquidation(B/S): `${buy_liq:,.0f}` / `${sell_liq:,.0f}`"
 
     await send_direct_tg(msg)
 
