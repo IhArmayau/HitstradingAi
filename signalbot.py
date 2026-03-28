@@ -162,7 +162,7 @@ class BotConfig:
     telegram_bot_token: Optional[str] = os.getenv("TELEGRAM_BOT_TOKEN")
     telegram_chat_id: Optional[str] = os.getenv("TELEGRAM_CHAT_ID")
     solana_wallet_address: Optional[str] = os.getenv("SOLANA_WALLET_ADDRESS")
-    model_version: str = "v7.9.7-production"
+    model_version: str = "v7.9.8-production"
 
 # -----------------------------
 # Utility: API Resilience
@@ -368,11 +368,9 @@ class TradeExecutor:
         if not self.cfg.trade.enabled:
             logger.info(f"🚫 [READ-ONLY] {sig['symbol']} Signal Detected.")
             return
-
         pos_size = self.cfg.trade.max_position_size_usd
         if sig.get('priority') == 2:
             pos_size = pos_size * 1.5
-
         logger.info(f"📣 [EXECUTION] {sig['market_type']} | {sig['symbol']} | {sig['signal']} @ {sig['entry']} | Size: ${pos_size}")
 
 class SignalGenerator:
@@ -420,40 +418,45 @@ class SignalGenerator:
             return "NEUTRAL"
         except: return "NEUTRAL"
 
-    def _get_kucoin_ticker(self, symbol: str):
-        # Correctly maps CEX pair to KuCoin Futures symbol
-        base = symbol.split('/')[0]
-        if base == 'BTC': base = 'XBT'
-        return f"{base}USDTM"
+    async def get_kucoin_id(self, ccxt_symbol: str):
+        """Fetches the actual KuCoin contract ID and multiplier to ensure non-zero OI."""
+        try:
+            response = await self.exchange.futures_public_get_contracts_active()
+            contracts = response.get('data', [])
+            base = ccxt_symbol.split('/')[0].upper()
+            if base == "BTC": base = "XBT" 
+            for contract in contracts:
+                if contract['baseCurrency'] == base and contract['quoteCurrency'] == 'USDT':
+                    return contract['symbol'], float(contract.get('multiplier', 1.0))
+        except Exception as e:
+            logger.error(f"❌ KuCoin ID Lookup failed: {e}")
+        return None, 1.0
 
     async def analyze_funding_squeeze(self, symbol: str):
         funding, oi, is_squeeze = 0.0, 0.0, False
         try:
+            # 1. Fetch Funding Rate
             f_data = await self.exchange.fetch_funding_rate(symbol)
             funding = float(f_data.get('fundingRate', 0.0))
             
-            try:
-                # FIXED: Specific logic for KuCoin Futures Open Interest
-                if 'kucoin' in str(self.exchange.id).lower():
-                    ticker = self._get_kucoin_ticker(symbol)
-                    # Use the correct internal endpoint for KuCoin
-                    oi_data = await self.exchange.futures_public_get_open_interest({'symbol': ticker})
-                    oi = float(oi_data.get('data', {}).get('openInterest', 0.0))
-                else:
-                    oi_data = await self.exchange.fetch_open_interest(symbol)
-                    oi = float(oi_data.get('openInterestAmount') or 0.0)
+            # 2. Fetch OI with dynamic ID mapping
+            kucoin_id, multiplier = await self.get_kucoin_id(symbol)
+            if kucoin_id:
+                oi_response = await self.exchange.futures_public_get_open_interest({'symbol': kucoin_id})
+                raw_oi = float(oi_response.get('data', {}).get('openInterest', 0.0))
+                oi = raw_oi * multiplier
                 
                 last = self.prev_oi.get(symbol, 0)
                 oi_growth = (oi > last * 1.05) if last > 0 else False
                 self.prev_oi[symbol] = oi
                 is_squeeze = (funding < -0.01 and oi_growth)
-            except Exception as inner_e: 
-                logger.debug(f"OI Data retrieval failed for {symbol}: {inner_e}")
+            else:
+                logger.debug(f"Could not map KuCoin ID for {symbol}")
             
             return funding, oi, is_squeeze
         except Exception as e:
             logger.error(f"Funding/OI analysis failed for {symbol}: {e}")
-            return funding, oi, is_squeeze
+            return 0.0, 0.0, False
 
     async def generate_cex_signal(self, symbol: str):
         if self.cooldown_cache.get(symbol) and (datetime.now() - self.cooldown_cache[symbol]) < timedelta(minutes=self.cfg.trade.signal_cooldown_minutes):
@@ -469,7 +472,7 @@ class SignalGenerator:
                 df['adx'] = ta.trend.ADXIndicator(df['h'], df['l'], df['c']).adx()
                 current_adx = df['adx'].iloc[-1]
                 
-                logger.info(f"📊 {symbol} Audit -> ADX: {current_adx:.2f} | OI: {oi:.1f} | Funding: {funding*100:.4f}%")
+                logger.info(f"📊 {symbol} Audit -> ADX: {current_adx:.2f} | OI: {oi:.0f} | Funding: {funding*100:.4f}%")
                 
                 if current_adx < self.cfg.indicators.adx_threshold: 
                     return
@@ -489,7 +492,6 @@ class SignalGenerator:
                         return
                     
                     social = await self.sentinel.get_sentiment(symbol)
-                    
                     entry_price = float(last['c'])
                     sl = entry_price - (last['atr'] * self.cfg.indicators.atr_sl_mult) if stype == "BUY" else entry_price + (last['atr'] * self.cfg.indicators.atr_sl_mult)
                     tp = entry_price + (last['atr'] * self.cfg.indicators.atr_tp_mult) if stype == "BUY" else entry_price - (last['atr'] * self.cfg.indicators.atr_tp_mult)
@@ -526,9 +528,9 @@ background_tasks = set()
 @app.on_event("startup")
 async def startup():
     global session, generator
-    await store.init_db()
-    # Ensure models directory exists for safety
+    # Ensure directory exists for model
     Path("models").mkdir(exist_ok=True)
+    await store.init_db()
     asyncio.create_task(run_background_initialization())
     logger.info(f"🚀 QuikPulse {cfg.model_version} Port Listener Started.")
 
@@ -587,25 +589,20 @@ async def health(request: Request):
 
 @app.post("/webhook")
 async def combined_webhook_handler(request: Request):
-    # FIXED: Added entry log to verify route visibility
     logger.info("🔔 WEBHOOK ROUTE TRIGGERED")
     try:
         data = await request.json()
-        logger.debug(f"Webhook Payload: {str(data)[:200]}")
         db_wallets = store.wallet_cache
         
         if isinstance(data, dict) and "event" in data:
             for act in data.get("event", {}).get("activity", []):
                 buyer = act.get("fromAddress")
                 mint = act.get("rawContract", {}).get("address")
-                
                 if not mint and "log" in act:
                     mints = re.findall(r'[1-9A-HJ-NP-Za-km-z]{32,44}', str(act))
                     if mints: mint = mints[0]
-
                 if not mint or not buyer: continue
                 if await store.has_open_signal(mint): continue
-                
                 dex_info = await generator.dex.get_price_data(mint)
                 await store.insert_candidate(buyer, mint, dex_info['price'])
                 is_whale = await generator.hunter.is_whale_funded(buyer)
@@ -620,11 +617,9 @@ async def combined_webhook_handler(request: Request):
                 mint, buyer = swap.get("tokenOutMint"), event.get("feePayer")
                 if not mint or not buyer: continue
                 if await store.has_open_signal(mint): continue
-                
                 is_whale, is_sniper = await generator.hunter.is_whale_funded(buyer), buyer in db_wallets
                 if is_sniper or is_whale:
                     await process_dex_signal(mint, buyer, is_whale, is_sniper)
-                    
         return JSONResponse({"status": "success"})
     except Exception as e:
         logger.error(f"Webhook Failure: {e}")
@@ -635,15 +630,12 @@ async def process_dex_signal(mint: str, buyer: str, is_whale: bool, is_sniper: b
     buyer_label = store.wallet_cache.get(buyer, "")
     if "Expert-Hunter" in buyer_label: priority_level = 2
     elif is_sniper or is_whale: priority_level = 1
-
     dex_data = await generator.dex.get_price_data(mint)
     if dex_data['price'] <= 0: return
-
     safety = await generator.security.get_safety_report(mint, dex_data['vol24'], dex_data['liq'], cfg.trade.min_liquidity_usd)
     if safety['is_rugged']:
         logger.info(f"🚫 Skipped {dex_data['symbol']} due to low liquidity (${dex_data['liq']})")
         return
-
     sig = {
         "timestamp": datetime.now(timezone.utc).isoformat(), "symbol": dex_data['symbol'],
         "market_type": "DEX", "contract_address": mint, "signal": "BUY", "entry": dex_data['price'],
@@ -665,22 +657,18 @@ async def telegram_command_handler(request: Request):
         parts = text.split()
         if not parts: return JSONResponse({"status": "ok"})
         cmd = parts[0].lower()
-
         if cmd == "/status":
             cex_txt = ", ".join([f"`{s}`" for s in cfg.symbols]) if cfg.symbols else "None"
             res = (f"📊 **QuikPulse Dashboard**\n━━━━━━━━━━━━━━━\n🤖 **Status:** `LIVE` 🟢\n📈 **CEX Pairs:** {cex_txt}\n🎯 **DEX Active:** `{len(generator.active_monitors_data)}` tokens\n🧬 **Wallets:** `{len(store.wallet_cache)}` tracked\n━━━━━━━━━━━━━━━")
             await send_direct_tg(res)
-        
         elif cmd == "/balance":
-            if not cfg.solana_wallet_address:
-                await send_direct_tg("❌ Wallet address not set in ENV.")
+            if not cfg.solana_wallet_address: await send_direct_tg("❌ Wallet address not set in ENV.")
             else:
                 payload = {"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [cfg.solana_wallet_address]}
                 data = await request_with_retry(session, "POST", ALCHEMY_RPC_URL, json=payload)
                 lamports = data.get("result", {}).get("value", 0)
                 sol = lamports / 1_000_000_000
                 await send_direct_tg(f"💰 **Wallet Balance**\n━━━━━━━━━━━━━━━\nAddress: `{cfg.solana_wallet_address[:6]}...`\nSOL: `{sol:.4f}`")
-
         elif cmd == "/top":
             async with store.async_session() as session_db:
                 stmt = select(TrackedWallet.label, func.count(WalletCandidate.id)).join(WalletCandidate, TrackedWallet.address == WalletCandidate.address).where(WalletCandidate.is_win == 1).group_by(TrackedWallet.label).order_by(func.count(WalletCandidate.id).desc()).limit(5)
@@ -688,60 +676,38 @@ async def telegram_command_handler(request: Request):
                 top_hunters = res.all()
                 msg = "🏆 **Top Hunters (Verified Wins)**\n━━━━━━━━━━━━━━━\n"
                 if not top_hunters: msg += "_No wins recorded yet._"
-                for label, wins in top_hunters:
-                    msg += f"👤 {label}: **{wins} Wins**\n"
+                for label, wins in top_hunters: msg += f"👤 {label}: **{wins} Wins**\n"
                 await send_direct_tg(msg)
-
         elif cmd == "/logs":
-            try:
-                if os.path.exists(AUDIT_LOG_FILE):
-                    with open(AUDIT_LOG_FILE, "r") as f:
-                        lines = f.readlines()
-                        last_logs = "".join(lines[-20:])
-                        await send_direct_tg(f"📋 **Recent Audit Logs:**\n\n```\n{last_logs}\n```")
-                else:
-                    await send_direct_tg("⚠️ Audit log file not found.")
-            except Exception as e:
-                await send_direct_tg(f"❌ Error reading logs: {e}")
-
+            if os.path.exists(AUDIT_LOG_FILE):
+                with open(AUDIT_LOG_FILE, "r") as f:
+                    lines = f.readlines()
+                    last_logs = "".join(lines[-20:])
+                    await send_direct_tg(f"📋 **Recent Audit Logs:**\n\n```\n{last_logs}\n```")
+            else: await send_direct_tg("⚠️ Audit log file not found.")
         elif cmd == "/config" and len(parts) > 2:
-            key = parts[1].lower()
-            val = parts[2]
-            if key == "adx":
-                cfg.indicators.adx_threshold = int(val)
-                await send_direct_tg(f"✅ ADX Threshold updated to `{val}`")
-            elif key == "tp":
-                cfg.indicators.atr_tp_mult = float(val)
-                await send_direct_tg(f"✅ Take Profit Mult updated to `{val}`")
-            elif key == "sl":
-                cfg.indicators.atr_sl_mult = float(val)
-                await send_direct_tg(f"✅ Stop Loss Mult updated to `{val}`")
-            elif key == "liq":
-                cfg.trade.min_liquidity_usd = float(val)
-                await send_direct_tg(f"✅ Min Liquidity Filter set to `${val}`")
-
+            key, val = parts[1].lower(), parts[2]
+            if key == "adx": cfg.indicators.adx_threshold = int(val)
+            elif key == "tp": cfg.indicators.atr_tp_mult = float(val)
+            elif key == "sl": cfg.indicators.atr_sl_mult = float(val)
+            elif key == "liq": cfg.trade.min_liquidity_usd = float(val)
+            await send_direct_tg(f"✅ {key.upper()} updated to `{val}`")
         elif cmd == "/clearlogs":
-            try:
-                open(AUDIT_LOG_FILE, "w").close()
-                await send_direct_tg("🧹 Audit logs cleared successfully.")
-            except Exception as e:
-                await send_direct_tg(f"❌ Failed to clear logs: {e}")
-
+            open(AUDIT_LOG_FILE, "w").close()
+            await send_direct_tg("🧹 Audit logs cleared successfully.")
         elif cmd == "/list":
             wallets = store.wallet_cache
             if not wallets: await send_direct_tg("📭 No insiders currently tracked.")
             else:
                 msg = "🎯 **Tracked Insiders**\n\n"
-                for i, (addr, label) in enumerate(wallets.items(), 1):
-                    msg += f"{i}. `{addr}`\n   └ Label: *{label}*\n"
+                for i, (addr, label) in enumerate(wallets.items(), 1): msg += f"{i}. `{addr}`\n   └ Label: *{label}*\n"
                 await send_direct_tg(msg)
         elif cmd == "/hunt":
             async with store.async_session() as session_db:
                 total_c = await session_db.execute(select(func.count(WalletCandidate.id)))
                 wins = await session_db.execute(select(func.count(WalletCandidate.id)).where(WalletCandidate.is_win == 1))
                 cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-                stmt = select(WalletCandidate).where(WalletCandidate.timestamp >= cutoff).limit(20)
-                res = await session_db.execute(stmt)
+                res = await session_db.execute(select(WalletCandidate).where(WalletCandidate.timestamp >= cutoff).limit(20))
                 candidates = res.scalars().all()
                 leaderboard = []
                 for c in candidates:
@@ -750,12 +716,10 @@ async def telegram_command_handler(request: Request):
                         roi = ((curr['price'] - c.entry_price) / c.entry_price) * 100
                         leaderboard.append((c.address, roi, curr['symbol']))
                 leaderboard.sort(key=lambda x: x[1], reverse=True)
-                top_3 = leaderboard[:3]
                 msg = (f"🧬 **Hunter Audit Status**\n━━━━━━━━━━━━━━━\n🕵️ Candidates: `{total_c.scalar()}`\n🏆 Confirmed Wins: `{wins.scalar()}`\n\n🔥 **24h Performers:**\n")
-                if not top_3: msg += "_No active performers._"
+                if not leaderboard: msg += "_No active performers._"
                 else:
-                    for i, (addr, roi, sym) in enumerate(top_3, 1):
-                        msg += f"{i}. `{addr[:6]}...` | *{sym}* | **+{roi:.1f}%**\n"
+                    for i, (addr, roi, sym) in enumerate(leaderboard[:3], 1): msg += f"{i}. `{addr[:6]}...` | *{sym}* | **+{roi:.1f}%**\n"
                 await send_direct_tg(msg)
         elif cmd == "/pair" and len(parts) > 1:
             pair = parts[1].upper()
@@ -779,7 +743,7 @@ async def telegram_command_handler(request: Request):
             cfg.trade.enabled = False
             await send_direct_tg("🛑 Trading Engine **PAUSED**")
         elif cmd == "/help":
-            await send_direct_tg("📖 **QuikPulse Guide**\n/status, /balance, /top, /config [adx/tp/sl/liq], /logs, /clearlogs, /list, /hunt, /pair [SYM], /addwallet [ADDR], /resume, /pause")
+            await send_direct_tg("📖 **QuikPulse Guide**\n/status, /balance, /top, /config, /logs, /clearlogs, /list, /hunt, /pair, /addwallet, /resume, /pause")
         return JSONResponse({"status": "ok"})
     except Exception as e:
         logger.error(f"TG Error: {e}")
@@ -791,12 +755,10 @@ async def hunting_audit_loop():
             await asyncio.sleep(3600)
             async with store.async_session() as session_db:
                 cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-                q = select(WalletCandidate).where(WalletCandidate.timestamp >= cutoff).where(WalletCandidate.is_win == 0)
-                res = await session_db.execute(q)
+                res = await session_db.execute(select(WalletCandidate).where(WalletCandidate.timestamp >= cutoff).where(WalletCandidate.is_win == 0))
                 for c in res.scalars().all():
                     curr = await generator.dex.get_price_data(c.token_mint)
-                    if curr['price'] >= (c.entry_price * cfg.min_hunter_profit_mult):
-                        c.is_win = 1
+                    if curr['price'] >= (c.entry_price * cfg.min_hunter_profit_mult): c.is_win = 1
                 await session_db.commit()
                 consistency = (select(WalletCandidate.address, func.count(WalletCandidate.id)).where(WalletCandidate.is_win == 1).group_by(WalletCandidate.address).having(func.count(WalletCandidate.id) >= cfg.min_hunter_wins_required))
                 winners = await session_db.execute(consistency)
@@ -832,7 +794,6 @@ async def background_monitor():
                 logger.info(f"🔍 Heartbeat: Scanning {s} for setups...")
                 await generator.generate_cex_signal(s)
                 await asyncio.sleep(5)
-            
             logger.info(f"😴 Scan cycle complete. Sleeping for {cfg.poll_interval}s...")
             await asyncio.sleep(cfg.poll_interval)
         except Exception as e: 
@@ -850,14 +811,11 @@ async def notify_new_signal(sig, session, cfg, is_whale=False, is_sniper=False, 
     elif is_sniper: prefix = "🎯 *SNIPER*"
     elif is_whale: prefix = "🐋 *WHALE*"
     else: prefix = "🚀 *SIGNAL*"
-    
     msg = (f"{prefix}\nPair: `{sig['symbol']}`\nAction: {sig['signal']}\nEntry: `${sig['entry']}`")
     if sig.get("sl"): msg += f"\nSL: `${sig['sl']}`"
     if sig.get("tp"): msg += f"\nTP: `${sig['tp']}`"
-    
     if sig.get('funding') or sig.get('open_interest'):
         msg += f"\n📊 OI: `{sig['open_interest']:.0f}` | Funding: `{sig['funding']*100:.4f}%`"
-        
     await send_direct_tg(msg)
 
 async def send_direct_tg(text: str):
