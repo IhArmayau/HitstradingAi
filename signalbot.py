@@ -423,7 +423,7 @@ class SignalGenerator:
         except: return "NEUTRAL"
 
     def _get_coinalyze_ticker(self, symbol: str):
-        # Cleans 'BTC/USDT:USDT' -> 'BTCUSDT_PERP.A' (Proven format)
+        # Cleans 'BTC/USDT:USDT' -> 'BTCUSDT_PERP.A'
         base = symbol.split('/')[0].upper()
         return f"{base}USDT_PERP.A"
 
@@ -434,7 +434,6 @@ class SignalGenerator:
         if params is None:
             params = {}
             
-        # Passing verified key directly in params as proven via curl
         params['api_key'] = COINALYZE_API_KEY
         url = f"https://api.coinalyze.net/v1/{endpoint}"
         
@@ -484,7 +483,6 @@ class SignalGenerator:
             })
             
             if liq_data and len(liq_data) > 0:
-                # Summing recent liquidations across available exchanges in the list
                 for item in liq_data:
                     liquidations_buy += float(item.get('buy_vol', 0))
                     liquidations_sell += float(item.get('sell_vol', 0))
