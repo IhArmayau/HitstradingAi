@@ -423,9 +423,8 @@ class SignalGenerator:
         except: return "NEUTRAL"
 
     def _get_coinalyze_ticker(self, symbol: str):
-        # Cleans 'ETH/USDT:USDT' -> 'ETHUSDT_PERP.A'
-        base = symbol.split('/')[0].upper()
-        return f"{base}USDT_PERP.A"
+        base = symbol.split(':')[0].split('/')[0].upper()
+        return f"{base}USDT_PERP"
 
     async def fetch_coinalyze(self, endpoint, params=None):
         if not COINALYZE_API_KEY:
@@ -446,7 +445,6 @@ class SignalGenerator:
                     return await self.fetch_coinalyze(endpoint, params)
                 if resp.status == 200:
                     data = await resp.json()
-                    # Coinalyze returns a list of objects, we return the list
                     return data if data else None
                 else:
                     text = await resp.text()
@@ -458,16 +456,18 @@ class SignalGenerator:
     async def analyze_funding_squeeze(self, symbol: str):
         try:
             c_ticker = self._get_coinalyze_ticker(symbol)
+            params = {"symbols": [c_ticker]}
             
+            logger.info(f"📡 Coinalyze Analytics → {c_ticker} | Params: {params}")
+
             # 1. Fetch Aggregated Funding Rate
-            funding_data = await self.fetch_coinalyze("predicted-funding-rate", {"symbols": c_ticker})
-            # funding_data is a list: [{'symbol': '...', 'value': 0.0001}]
+            funding_data = await self.fetch_coinalyze("funding-rate", params)
             funding = float(funding_data[0]['value']) if (funding_data and len(funding_data) > 0) else 0.0
 
             # 2. Fetch Aggregated Open Interest
             oi = 0.0
             oi_growth = False
-            oi_data = await self.fetch_coinalyze("current-open-interest", {"symbols": c_ticker})
+            oi_data = await self.fetch_coinalyze("open-interest", params)
             if oi_data and len(oi_data) > 0:
                 oi = float(oi_data[0]['value'])
                 last = self.prev_oi.get(symbol, 0)
@@ -477,22 +477,29 @@ class SignalGenerator:
             # 3. Fetch Aggregated Liquidations (Last 3 hours)
             liquidations_buy = 0.0
             liquidations_sell = 0.0
-            liq_data = await self.fetch_coinalyze("liquidation-history", {
-                "symbols": c_ticker,
+            
+            liq_params = params.copy()
+            liq_params.update({
                 "interval": "1hour",
                 "from": int((datetime.now() - timedelta(hours=3)).timestamp()),
                 "to": int(datetime.now().timestamp())
             })
             
-            # liq_data is a list of historical snapshots
+            liq_data = await self.fetch_coinalyze("liquidations", liq_params)
+            
             if liq_data and len(liq_data) > 0:
-                # The data is nested: liq_data[0]['history'] contains the actual list
-                history = liq_data[0].get('history', [])
+                history = liq_data[0].get('data', [])
                 for item in history:
-                    liquidations_buy += float(item.get('buy_vol', 0))
-                    liquidations_sell += float(item.get('sell_vol', 0))
+                    liquidations_buy += float(item.get('buy_volume', 0))
+                    liquidations_sell += float(item.get('sell_volume', 0))
 
-            is_squeeze = (funding < -0.01 and oi_growth and liquidations_sell > 0)
+            # Smart Money Logic: Trapped Shorts + OI Growth + Heavy Sell Liquidations
+            is_squeeze = (
+                funding < -0.01 and 
+                oi_growth and 
+                liquidations_sell > (liquidations_buy * 1.5)
+            )
+            
             return funding, oi, is_squeeze, liquidations_buy, liquidations_sell
         except Exception as e:
             logger.error(f"Coinalyze Analytics Error for {symbol}: {e}")
