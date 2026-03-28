@@ -422,6 +422,12 @@ class SignalGenerator:
             return "NEUTRAL"
         except: return "NEUTRAL"
 
+    def _get_kucoin_ticker(self, symbol: str):
+        # Maps 'BTC/USDT:USDT' -> 'XBTUSDTM'
+        base = symbol.split('/')[0]
+        if base == 'BTC': base = 'XBT'
+        return f"{base}USDTM"
+
     async def analyze_funding_squeeze(self, symbol: str):
         try:
             f_data = await self.exchange.fetch_funding_rate(symbol)
@@ -430,16 +436,24 @@ class SignalGenerator:
             oi = 0.0
             oi_growth = False
             try:
-                oi_data = await self.exchange.fetch_open_interest(symbol)
-                oi = float(oi_data.get('openInterestAmount') or 0.0)
+                if 'kucoin' in str(self.exchange.id).lower():
+                    # Optimized KuCoin Fetch to avoid "not supported" error
+                    ticker = self._get_kucoin_ticker(symbol)
+                    oi_data = await self.exchange.futures_public_get_open_interest({'symbol': ticker})
+                    oi = float(oi_data.get('data', {}).get('openInterest', 0.0))
+                else:
+                    oi_data = await self.exchange.fetch_open_interest(symbol)
+                    oi = float(oi_data.get('openInterestAmount') or 0.0)
+                
                 last = self.prev_oi.get(symbol, 0)
                 oi_growth = (oi > last * 1.05) if last > 0 else False
                 self.prev_oi[symbol] = oi
-            except: pass
+            except Exception as e: 
+                logger.debug(f"OI Sub-fetch error for {symbol}: {e}")
             
             return funding, oi, (funding < -0.01 and oi_growth)
         except Exception as e:
-            logger.error(f"Data Fetch Error for {symbol}: {e}")
+            logger.error(f"Funding Fetch Error for {symbol}: {e}")
             return 0.0, 0.0, False
 
     async def generate_cex_signal(self, symbol: str):
