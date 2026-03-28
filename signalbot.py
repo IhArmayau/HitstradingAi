@@ -120,7 +120,7 @@ ALCHEMY_AUTH_TOKEN = os.getenv("ALCHEMY_AUTH_TOKEN", "")
 ALCHEMY_WEBHOOK_ID = os.getenv("ALCHEMY_WEBHOOK_ID", "")
 ALCHEMY_RPC_URL = f"https://solana-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
 SANTIMENT_API_KEY = os.getenv("SANTIMENT_API_KEY", "Eo6zp2wemnkb4cui_thgwsepbufktb4qz")
-COINALYZE_API_KEY = os.getenv("COINALYZE_API_KEY")
+COINALYZE_API_KEY = os.getenv("COINALYZE_API_KEY", "4bcf1a42-1680-49a3-b51b-788295dc0672")
 
 if SANTIMENT_API_KEY:
     san.ApiConfig.api_key = SANTIMENT_API_KEY
@@ -423,18 +423,23 @@ class SignalGenerator:
         except: return "NEUTRAL"
 
     def _get_coinalyze_ticker(self, symbol: str):
-        # Coinalyze expects tickers like "BTCUSDT" for aggregated perp data
-        base = symbol.split('/')[0]
-        return f"{base}USDT"
+        # Cleans 'BTC/USDT:USDT' -> 'BTCUSDT_PERP.A' (Proven format)
+        base = symbol.split('/')[0].upper()
+        return f"{base}USDT_PERP.A"
 
     async def fetch_coinalyze(self, endpoint, params=None):
         if not COINALYZE_API_KEY:
             return None
+        
+        if params is None:
+            params = {}
+            
+        # Passing verified key directly in params as proven via curl
+        params['api_key'] = COINALYZE_API_KEY
         url = f"https://api.coinalyze.net/v1/{endpoint}"
-        headers = {"api_key": COINALYZE_API_KEY}
         
         try:
-            async with self.session.get(url, headers=headers, params=params) as resp:
+            async with self.session.get(url, params=params) as resp:
                 if resp.status == 429:
                     wait = int(resp.headers.get("Retry-After", 10))
                     logger.warning(f"Coinalyze 429. Waiting {wait}s...")
@@ -443,6 +448,9 @@ class SignalGenerator:
                 if resp.status == 200:
                     data = await resp.json()
                     return data if data else None
+                else:
+                    text = await resp.text()
+                    logger.error(f"Coinalyze Error {resp.status}: {text}")
         except Exception as e:
             logger.error(f"Coinalyze request error: {e}")
         return None
@@ -476,13 +484,12 @@ class SignalGenerator:
             })
             
             if liq_data and len(liq_data) > 0:
-                # Summing recent liquidations across available exchanges in the aggregated list
-                liquidations_buy = sum(float(item.get('buy_vol', 0)) for item in liq_data)
-                liquidations_sell = sum(float(item.get('sell_vol', 0)) for item in liq_data)
+                # Summing recent liquidations across available exchanges in the list
+                for item in liq_data:
+                    liquidations_buy += float(item.get('buy_vol', 0))
+                    liquidations_sell += float(item.get('sell_vol', 0))
 
-            # Squeeze logic: Negative funding + Rising OI + Significant Sell (Long) Liquidations
             is_squeeze = (funding < -0.01 and oi_growth and liquidations_sell > 0)
-
             return funding, oi, is_squeeze, liquidations_buy, liquidations_sell
         except Exception as e:
             logger.error(f"Coinalyze Analytics Error for {symbol}: {e}")
