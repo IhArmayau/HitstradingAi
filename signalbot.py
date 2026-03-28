@@ -8,6 +8,7 @@ import os
 import json
 import pickle
 import sys
+import re
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Any
 from datetime import datetime, timezone, timedelta
@@ -36,7 +37,6 @@ except ImportError:
 # -----------------------------
 load_dotenv()
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-
 AUDIT_LOG_FILE = "quikpulse_audit.log"
 
 file_handler = logging.FileHandler(AUDIT_LOG_FILE)
@@ -132,6 +132,7 @@ class TradeConfig:
     max_funding_threshold: float = 0.05
     min_win_rate_threshold: float = 0.40
     signal_cooldown_minutes: int = int(os.getenv("SIGNAL_COOLDOWN", 60))
+    min_liquidity_usd: float = float(os.getenv("MIN_LIQUIDITY_USD", 10000.0))
 
 @dataclass
 class IndicatorsConfig:
@@ -160,7 +161,8 @@ class BotConfig:
     ml_model_path: str = os.getenv("ML_MODEL_PATH", "models/lstm_model.h5")
     telegram_bot_token: Optional[str] = os.getenv("TELEGRAM_BOT_TOKEN")
     telegram_chat_id: Optional[str] = os.getenv("TELEGRAM_CHAT_ID")
-    model_version: str = "v7.9.5-production"
+    solana_wallet_address: Optional[str] = os.getenv("SOLANA_WALLET_ADDRESS")
+    model_version: str = "v7.9.7-production"
 
 # -----------------------------
 # Utility: API Resilience
@@ -272,13 +274,14 @@ class SignalStore:
 # -----------------------------
 async def sync_alchemy_webhook(addresses: List[str]):
     if not ALCHEMY_AUTH_TOKEN or not ALCHEMY_WEBHOOK_ID: return
+    # Optimization: Filter to only tracked wallets to save credits
     url = f"https://dashboard.alchemy.com/api/update-webhook-addresses"
     headers = {"X-Alchemy-Token": ALCHEMY_AUTH_TOKEN, "Content-Type": "application/json"}
     payload = {"webhook_id": ALCHEMY_WEBHOOK_ID, "addresses_to_add": addresses, "addresses_to_remove": []}
     try:
         async with aiohttp.ClientSession() as s:
             async with s.patch(url, json=payload, headers=headers) as resp:
-                logger.info(f"Alchemy Sync Status: {resp.status}")
+                logger.info(f"Alchemy Webhook Sync Status: {resp.status}")
     except Exception as e:
         logger.error(f"Alchemy Sync Failed: {e}")
 
@@ -295,7 +298,7 @@ class DiscoveryHunter:
         try:
             data = await request_with_retry(self.session, "POST", ALCHEMY_RPC_URL, json=payload)
             balance = int(data.get("result", {}).get("value", 0))
-            return balance > 50_000_000_000
+            return balance > 50_000_000_000 # 50 SOL
         except: return False
 
 class SocialSentinel:
@@ -345,9 +348,17 @@ class ClusterEngine:
         return len(self.history[mint])
 
 class SecurityEngine:
-    async def get_safety_report(self, address: str, vol_24h: float, liq: float) -> Dict[str, Any]:
+    async def get_safety_report(self, address: str, vol_24h: float, liq: float, min_liq: float = 10000.0) -> Dict[str, Any]:
         vl_ratio = vol_24h / liq if liq > 0 else 0.0
-        return {"safety_score": 80 if (0 < vl_ratio < 5) else 40, "is_rugged": vl_ratio > 10.0, "vl_ratio": vl_ratio}
+        # Check Liquidity Threshold
+        is_safe_liquidity = liq >= min_liq
+        safety_score = 80 if (0 < vl_ratio < 5 and is_safe_liquidity) else 40
+        return {
+            "safety_score": safety_score, 
+            "is_rugged": vl_ratio > 10.0 or not is_safe_liquidity, 
+            "vl_ratio": vl_ratio,
+            "liquidity": liq
+        }
 
 # -----------------------------
 # Production Execution Engine
@@ -414,14 +425,17 @@ class SignalGenerator:
     async def analyze_funding_squeeze(self, symbol: str):
         try:
             f_data = await self.exchange.fetch_funding_rate(symbol)
-            oi_data = await self.exchange.fetch_open_interest(symbol)
-            
             funding = float(f_data.get('fundingRate', 0.0))
-            oi = float(oi_data.get('openInterestAmount') or 0.0)
             
-            last = self.prev_oi.get(symbol, 0)
-            oi_growth = (oi > last * 1.05) if last > 0 else False
-            self.prev_oi[symbol] = oi
+            oi = 0.0
+            oi_growth = False
+            try:
+                oi_data = await self.exchange.fetch_open_interest(symbol)
+                oi = float(oi_data.get('openInterestAmount') or 0.0)
+                last = self.prev_oi.get(symbol, 0)
+                oi_growth = (oi > last * 1.05) if last > 0 else False
+                self.prev_oi[symbol] = oi
+            except: pass
             
             return funding, oi, (funding < -0.01 and oi_growth)
         except Exception as e:
@@ -556,24 +570,18 @@ async def health(request: Request):
         "db_engine": "ready" if store.engine else "not_initialized"
     })
 
-# --- UPDATED WEBHOOK HANDLER FOR ALCHEMY RESILIENCE ---
 @app.post("/webhook")
 async def combined_webhook_handler(request: Request):
     try:
         data = await request.json()
         db_wallets = store.wallet_cache
         
-        # 1. HANDLE ALCHEMY WEBHOOKS (Dict with 'event' key)
         if isinstance(data, dict) and "event" in data:
             for act in data.get("event", {}).get("activity", []):
                 buyer = act.get("fromAddress")
-                # Look for token mint in rawContract or within the log details
                 mint = act.get("rawContract", {}).get("address")
                 
-                # If standard mint is missing (common for swaps), scan for account keys
                 if not mint and "log" in act:
-                    # Attempt to find common Solana Mint patterns in the log
-                    import re
                     mints = re.findall(r'[1-9A-HJ-NP-Za-km-z]{32,44}', str(act))
                     if mints: mint = mints[0]
 
@@ -587,7 +595,6 @@ async def combined_webhook_handler(request: Request):
                 if is_sniper or is_whale:
                     await process_dex_signal(mint, buyer, is_whale, is_sniper)
 
-        # 2. HANDLE HELIUS WEBHOOKS (List of transactions)
         elif isinstance(data, list):
             for event in data:
                 if event.get("type") != "SWAP": continue
@@ -613,7 +620,13 @@ async def process_dex_signal(mint: str, buyer: str, is_whale: bool, is_sniper: b
 
     dex_data = await generator.dex.get_price_data(mint)
     if dex_data['price'] <= 0: return
-    safety = await generator.security.get_safety_report(mint, dex_data['vol24'], dex_data['liq'])
+
+    # Apply Liquidity Filter
+    safety = await generator.security.get_safety_report(mint, dex_data['vol24'], dex_data['liq'], cfg.trade.min_liquidity_usd)
+    if safety['is_rugged']:
+        logger.info(f"🚫 Skipped {dex_data['symbol']} due to low liquidity (${dex_data['liq']})")
+        return
+
     sig = {
         "timestamp": datetime.now(timezone.utc).isoformat(), "symbol": dex_data['symbol'],
         "market_type": "DEX", "contract_address": mint, "signal": "BUY", "entry": dex_data['price'],
@@ -641,6 +654,27 @@ async def telegram_command_handler(request: Request):
             res = (f"📊 **QuikPulse Dashboard**\n━━━━━━━━━━━━━━━\n🤖 **Status:** `LIVE` 🟢\n📈 **CEX Pairs:** {cex_txt}\n🎯 **DEX Active:** `{len(generator.active_monitors_data)}` tokens\n🧬 **Wallets:** `{len(store.wallet_cache)}` tracked\n━━━━━━━━━━━━━━━")
             await send_direct_tg(res)
         
+        elif cmd == "/balance":
+            if not cfg.solana_wallet_address:
+                await send_direct_tg("❌ Wallet address not set in ENV.")
+            else:
+                payload = {"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [cfg.solana_wallet_address]}
+                data = await request_with_retry(session, "POST", ALCHEMY_RPC_URL, json=payload)
+                lamports = data.get("result", {}).get("value", 0)
+                sol = lamports / 1_000_000_000
+                await send_direct_tg(f"💰 **Wallet Balance**\n━━━━━━━━━━━━━━━\nAddress: `{cfg.solana_wallet_address[:6]}...`\nSOL: `{sol:.4f}`")
+
+        elif cmd == "/top":
+            async with store.async_session() as session_db:
+                stmt = select(TrackedWallet.label, func.count(WalletCandidate.id)).join(WalletCandidate, TrackedWallet.address == WalletCandidate.address).where(WalletCandidate.is_win == 1).group_by(TrackedWallet.label).order_by(func.count(WalletCandidate.id).desc()).limit(5)
+                res = await session_db.execute(stmt)
+                top_hunters = res.all()
+                msg = "🏆 **Top Hunters (Verified Wins)**\n━━━━━━━━━━━━━━━\n"
+                if not top_hunters: msg += "_No wins recorded yet._"
+                for label, wins in top_hunters:
+                    msg += f"👤 {label}: **{wins} Wins**\n"
+                await send_direct_tg(msg)
+
         elif cmd == "/logs":
             try:
                 if os.path.exists(AUDIT_LOG_FILE):
@@ -665,6 +699,9 @@ async def telegram_command_handler(request: Request):
             elif key == "sl":
                 cfg.indicators.atr_sl_mult = float(val)
                 await send_direct_tg(f"✅ Stop Loss Mult updated to `{val}`")
+            elif key == "liq":
+                cfg.trade.min_liquidity_usd = float(val)
+                await send_direct_tg(f"✅ Min Liquidity Filter set to `${val}`")
 
         elif cmd == "/clearlogs":
             try:
@@ -725,7 +762,7 @@ async def telegram_command_handler(request: Request):
             cfg.trade.enabled = False
             await send_direct_tg("🛑 Trading Engine **PAUSED**")
         elif cmd == "/help":
-            await send_direct_tg("📖 **QuikPulse Guide**\n/status, /config [adx/tp/sl] [val], /logs, /clearlogs, /list, /hunt, /pair [SYM], /addwallet [ADDR], /resume, /pause")
+            await send_direct_tg("📖 **QuikPulse Guide**\n/status, /balance, /top, /config [adx/tp/sl/liq], /logs, /clearlogs, /list, /hunt, /pair [SYM], /addwallet [ADDR], /resume, /pause")
         return JSONResponse({"status": "ok"})
     except Exception as e:
         logger.error(f"TG Error: {e}")
