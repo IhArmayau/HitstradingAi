@@ -274,7 +274,6 @@ class SignalStore:
 # -----------------------------
 async def sync_alchemy_webhook(addresses: List[str]):
     if not ALCHEMY_AUTH_TOKEN or not ALCHEMY_WEBHOOK_ID: return
-    # Optimization: Filter to only tracked wallets to save credits
     url = f"https://dashboard.alchemy.com/api/update-webhook-addresses"
     headers = {"X-Alchemy-Token": ALCHEMY_AUTH_TOKEN, "Content-Type": "application/json"}
     payload = {"webhook_id": ALCHEMY_WEBHOOK_ID, "addresses_to_add": addresses, "addresses_to_remove": []}
@@ -350,7 +349,6 @@ class ClusterEngine:
 class SecurityEngine:
     async def get_safety_report(self, address: str, vol_24h: float, liq: float, min_liq: float = 10000.0) -> Dict[str, Any]:
         vl_ratio = vol_24h / liq if liq > 0 else 0.0
-        # Check Liquidity Threshold
         is_safe_liquidity = liq >= min_liq
         safety_score = 80 if (0 < vl_ratio < 5 and is_safe_liquidity) else 40
         return {
@@ -423,22 +421,22 @@ class SignalGenerator:
         except: return "NEUTRAL"
 
     def _get_kucoin_ticker(self, symbol: str):
-        # Maps 'BTC/USDT:USDT' -> 'XBTUSDTM'
+        # Correctly maps CEX pair to KuCoin Futures symbol
         base = symbol.split('/')[0]
         if base == 'BTC': base = 'XBT'
         return f"{base}USDTM"
 
     async def analyze_funding_squeeze(self, symbol: str):
+        funding, oi, is_squeeze = 0.0, 0.0, False
         try:
             f_data = await self.exchange.fetch_funding_rate(symbol)
             funding = float(f_data.get('fundingRate', 0.0))
             
-            oi = 0.0
-            oi_growth = False
             try:
+                # FIXED: Specific logic for KuCoin Futures Open Interest
                 if 'kucoin' in str(self.exchange.id).lower():
-                    # Optimized KuCoin Fetch to avoid "not supported" error
                     ticker = self._get_kucoin_ticker(symbol)
+                    # Use the correct internal endpoint for KuCoin
                     oi_data = await self.exchange.futures_public_get_open_interest({'symbol': ticker})
                     oi = float(oi_data.get('data', {}).get('openInterest', 0.0))
                 else:
@@ -448,13 +446,14 @@ class SignalGenerator:
                 last = self.prev_oi.get(symbol, 0)
                 oi_growth = (oi > last * 1.05) if last > 0 else False
                 self.prev_oi[symbol] = oi
-            except Exception as e: 
-                logger.debug(f"OI Sub-fetch error for {symbol}: {e}")
+                is_squeeze = (funding < -0.01 and oi_growth)
+            except Exception as inner_e: 
+                logger.debug(f"OI Data retrieval failed for {symbol}: {inner_e}")
             
-            return funding, oi, (funding < -0.01 and oi_growth)
+            return funding, oi, is_squeeze
         except Exception as e:
-            logger.error(f"Funding Fetch Error for {symbol}: {e}")
-            return 0.0, 0.0, False
+            logger.error(f"Funding/OI analysis failed for {symbol}: {e}")
+            return funding, oi, is_squeeze
 
     async def generate_cex_signal(self, symbol: str):
         if self.cooldown_cache.get(symbol) and (datetime.now() - self.cooldown_cache[symbol]) < timedelta(minutes=self.cfg.trade.signal_cooldown_minutes):
@@ -470,7 +469,7 @@ class SignalGenerator:
                 df['adx'] = ta.trend.ADXIndicator(df['h'], df['l'], df['c']).adx()
                 current_adx = df['adx'].iloc[-1]
                 
-                logger.info(f"📊 {symbol} Audit -> ADX: {current_adx:.2f} | OI: {oi:.0f} | Funding: {funding*100:.4f}%")
+                logger.info(f"📊 {symbol} Audit -> ADX: {current_adx:.2f} | OI: {oi:.1f} | Funding: {funding*100:.4f}%")
                 
                 if current_adx < self.cfg.indicators.adx_threshold: 
                     return
@@ -528,6 +527,8 @@ background_tasks = set()
 async def startup():
     global session, generator
     await store.init_db()
+    # Ensure models directory exists for safety
+    Path("models").mkdir(exist_ok=True)
     asyncio.create_task(run_background_initialization())
     logger.info(f"🚀 QuikPulse {cfg.model_version} Port Listener Started.")
 
@@ -586,8 +587,11 @@ async def health(request: Request):
 
 @app.post("/webhook")
 async def combined_webhook_handler(request: Request):
+    # FIXED: Added entry log to verify route visibility
+    logger.info("🔔 WEBHOOK ROUTE TRIGGERED")
     try:
         data = await request.json()
+        logger.debug(f"Webhook Payload: {str(data)[:200]}")
         db_wallets = store.wallet_cache
         
         if isinstance(data, dict) and "event" in data:
@@ -635,7 +639,6 @@ async def process_dex_signal(mint: str, buyer: str, is_whale: bool, is_sniper: b
     dex_data = await generator.dex.get_price_data(mint)
     if dex_data['price'] <= 0: return
 
-    # Apply Liquidity Filter
     safety = await generator.security.get_safety_report(mint, dex_data['vol24'], dex_data['liq'], cfg.trade.min_liquidity_usd)
     if safety['is_rugged']:
         logger.info(f"🚫 Skipped {dex_data['symbol']} due to low liquidity (${dex_data['liq']})")
