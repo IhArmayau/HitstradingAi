@@ -423,8 +423,9 @@ class SignalGenerator:
         except: return "NEUTRAL"
 
     def _get_coinalyze_ticker(self, symbol: str):
+        # Coinalyze expects tickers like "BTCUSDT" for aggregated perp data
         base = symbol.split('/')[0]
-        return f"{base}USDT_PERP"
+        return f"{base}USDT"
 
     async def fetch_coinalyze(self, endpoint, params=None):
         if not COINALYZE_API_KEY:
@@ -440,7 +441,8 @@ class SignalGenerator:
                     await asyncio.sleep(wait)
                     return await self.fetch_coinalyze(endpoint, params)
                 if resp.status == 200:
-                    return await resp.json()
+                    data = await resp.json()
+                    return data if data else None
         except Exception as e:
             logger.error(f"Coinalyze request error: {e}")
         return None
@@ -451,13 +453,13 @@ class SignalGenerator:
             
             # 1. Fetch Aggregated Funding Rate
             funding_data = await self.fetch_coinalyze("predicted-funding-rate", {"symbols": c_ticker})
-            funding = float(funding_data[0]['value']) if funding_data else 0.0
+            funding = float(funding_data[0]['value']) if (funding_data and len(funding_data) > 0) else 0.0
 
             # 2. Fetch Aggregated Open Interest
             oi = 0.0
             oi_growth = False
             oi_data = await self.fetch_coinalyze("current-open-interest", {"symbols": c_ticker})
-            if oi_data:
+            if oi_data and len(oi_data) > 0:
                 oi = float(oi_data[0]['value'])
                 last = self.prev_oi.get(symbol, 0)
                 oi_growth = (oi > last * 1.05) if last > 0 else False
@@ -474,9 +476,9 @@ class SignalGenerator:
             })
             
             if liq_data and len(liq_data) > 0:
-                # Summing recent liquidations
-                liquidations_buy = sum(float(item['buy_vol']) for item in liq_data)
-                liquidations_sell = sum(float(item['sell_vol']) for item in liq_data)
+                # Summing recent liquidations across available exchanges in the aggregated list
+                liquidations_buy = sum(float(item.get('buy_vol', 0)) for item in liq_data)
+                liquidations_sell = sum(float(item.get('sell_vol', 0)) for item in liq_data)
 
             # Squeeze logic: Negative funding + Rising OI + Significant Sell (Long) Liquidations
             is_squeeze = (funding < -0.01 and oi_growth and liquidations_sell > 0)
