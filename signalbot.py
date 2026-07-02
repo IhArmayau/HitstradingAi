@@ -427,7 +427,7 @@ async def shutdown():
 async def root():
     return {"message": "QuikPulse Pure-DEX Engine Running Successfully."}
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
     return {
         "status": "online",
