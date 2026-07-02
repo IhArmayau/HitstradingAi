@@ -611,26 +611,76 @@ async def telegram_command_handler(request: Request):
         if not parts: return JSONResponse({"status": "ok"})
         cmd = parts[0].lower()
 
+        # --- /status ---
         if cmd == "/status":
-            res = (f"📊 **QuikPulse DEX Engine**\n━━━━━━━━━━━━━━━\n🤖 **Status:** `PURE DEX MODE` 🟢\n🎯 **Active Tracks:** `{len(active_monitors_data)}` tokens\n🧬 **Database Insiders:** `{len(store.wallet_cache)}` tracked\n━━━━━━━━━━━━━━━")
+            res = (
+                f"📊 **QuikPulse DEX Engine**\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"🤖 **Status:** {'🟢 LIVE MODE' if cfg.trade.enabled else '🟡 READ-ONLY MODE'}\n"
+                f"🎯 **Active Tracks:** `{len(active_monitors_data)}` tokens\n"
+                f"🧬 **Database Insiders:** `{len(store.wallet_cache)}` tracked\n"
+                f"━━━━━━━━━━━━━━━"
+            )
             await send_direct_tg(res)
 
+        # --- /addwallet ---
         elif cmd == "/addwallet" and len(parts) > 1:
             await store.add_tracked_wallet(parts[1], "Manual")
             await send_direct_tg(f"✅ Target Locked on Wallet: `{parts[1]}`")
 
+        # --- /remwallet ---
         elif cmd == "/remwallet" and len(parts) > 1:
             await store.remove_tracked_wallet(parts[1])
             await send_direct_tg(f"❌ Target Dropped for Wallet: `{parts[1]}`")
 
-        elif cmd == "/listwallets":
+        # --- /list ---
+        elif cmd in ["/list", "/listwallets"]:
             wallets = store.wallet_cache
             if not wallets:
-                await send_direct_tg(" 📁 No wallets currently tracking inside active database storage maps.")
+                await send_direct_tg("📁 No wallets currently tracking inside database.")
             else:
                 lines = [f"• `{addr[:8]}...` ({label})" for addr, label in list(wallets.items())[:30]]
                 await send_direct_tg(f"🧬 **Tracked Insiders (Top 30):**\n" + "\n".join(lines))
 
+        # --- /hunt /stats ---
+        elif cmd in ["/hunt", "/stats"]:
+            async with store.async_session() as db:
+                cand_count = await db.execute(select(func.count(WalletCandidate.id)))
+                sig_count = await db.execute(select(func.count(SignalModel.id)))
+                await send_direct_tg(
+                    f"📈 **Insider Hunt & Performance Metrics:**\n"
+                    f"• Evaluated Candidates: `{cand_count.scalar()}`\n"
+                    f"• Dispatched Active Signals: `{sig_count.scalar()}`\n"
+                    f"• Monitoring Cache Size: `{len(active_monitors_data)}` entries"
+                )
+
+        # --- /logs ---
+        elif cmd == "/logs":
+            if os.path.exists(AUDIT_LOG_FILE):
+                with open(AUDIT_LOG_FILE, "r") as f:
+                    lines = f.readlines()[-20:]
+                log_chunk = "".join(lines) if lines else "Log file is empty."
+                await send_direct_tg(f"📋 **Last 20 Audit Log Entries:**\n```\n{log_chunk[-3500:]}\n```")
+            else:
+                await send_direct_tg("❌ Audit log file not found.")
+
+        # --- /clearlogs ---
+        elif cmd == "/clearlogs":
+            with open(AUDIT_LOG_FILE, "w") as f:
+                f.write(f"{datetime.now(timezone.utc).isoformat()} [INFO] Log wiped via command.\n")
+            await send_direct_tg("🧼 **Audit logs wiped clean successfully.**")
+
+        # --- /pause ---
+        elif cmd == "/pause":
+            cfg.trade.enabled = False
+            await send_direct_tg("⏸️ **Trade engine PAUSED.** Entering Read-Only tracking mode.")
+
+        # --- /resume ---
+        elif cmd == "/resume":
+            cfg.trade.enabled = True
+            await send_direct_tg("▶️ **Trade engine RESUMED.** Live execution active.")
+
+        # --- /signals ---
         elif cmd == "/signals":
             async with store.async_session() as db:
                 q = select(SignalModel).order_by(SignalModel.id.desc()).limit(10)
@@ -642,27 +692,21 @@ async def telegram_command_handler(request: Request):
                     lines = [f"• {s.symbol} | Entry: ${s.entry} | Status: `{s.status}`" for s in sigs]
                     await send_direct_tg(f"🎯 **Recent Core Generated Signals:**\n" + "\n".join(lines))
 
-        elif cmd == "/stats":
-            async with store.async_session() as db:
-                cand_count = await db.execute(select(func.count(WalletCandidate.id)))
-                sig_count = await db.execute(select(func.count(SignalModel.id)))
-                await send_direct_tg(
-                    f"📈 **System Performance Analytics Metrics:**\n"
-                    f"• Evaluated Candidates: `{cand_count.scalar()}`\n"
-                    f"• Dispatched Active Signals: `{sig_count.scalar()}`\n"
-                    f"• Monitoring Cache Memory Size: `{len(active_monitors_data)}` entries"
-                )
-
+        # --- /help ---
         elif cmd == "/help":
             commands = [
-                "/status - Check engine status",
-                "/addwallet [addr] - Track specialized wallet instance",
-                "/remwallet [addr] - Halt tracking instance targets",
-                "/listwallets - View active watchlists",
+                "/status - Check pure-DEX metrics",
+                "/list - View tracked wallets",
+                "/hunt - View evaluation statistics",
+                "/addwallet [addr] - Track new wallet",
+                "/remwallet [addr] - Untrack a wallet",
                 "/signals - Display past execution arrays",
-                "/stats - Ingestion architecture database counts"
+                "/logs - View last 20 debugger logs",
+                "/clearlogs - Wipe log history",
+                "/pause - Disable trade execution",
+                "/resume - Enable trade execution"
             ]
-            await send_direct_tg("📖 **DEX Bot Command Control System Manual:**\n" + "\n".join(commands))
+            await send_direct_tg("📖 **DEX Bot Operational Control Manual:**\n" + "\n".join(commands))
 
         return JSONResponse({"status": "ok"})
     except Exception:
