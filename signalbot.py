@@ -3,10 +3,11 @@ import asyncio
 import logging
 import os
 import sys
+import re
 import time
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Any, Tuple
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import aiohttp
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -14,7 +15,7 @@ from fastapi.responses import JSONResponse
 import uvicorn
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, Integer, String, Float, Text, select, delete, Index
+from sqlalchemy import Column, Integer, String, Float, Text, select, delete, func, Index
 
 # -----------------------------
 # Logging Configuration
@@ -110,7 +111,26 @@ class WalletCandidate(Base):
 
 Index("idx_wallet_cand_lookup", WalletCandidate.address, WalletCandidate.token_mint)
 
+class BotSetting(Base):
+    __tablename__ = "bot_settings"
+    key = Column(String, primary_key=True)
+    value = Column(Text)
+
 GLOBAL_TIMEOUT = aiohttp.ClientTimeout(total=5.0)
+
+async def request_with_retry(session: aiohttp.ClientSession, method: str, url: str, retries: int = 3, **kwargs):
+    kwargs["timeout"] = kwargs.get("timeout", GLOBAL_TIMEOUT)
+    for i in range(retries):
+        try:
+            async with session.request(method, url, **kwargs) as resp:
+                if resp.status == 429:
+                    wait = (i + 1) * 5
+                    await asyncio.sleep(wait)
+                    continue
+                return await resp.json()
+        except Exception as e:
+            if i == retries - 1: raise e
+            await asyncio.sleep(2 ** i)
 
 class PriceCache:
     def __init__(self, ttl_seconds: float = 3.0):
@@ -150,6 +170,24 @@ class SignalStore:
                 await session.commit()
             except Exception: await session.rollback()
 
+    async def add_tracked_wallet(self, address: str, label: str = "Manual"):
+        async with self.async_session() as session:
+            try:
+                await session.merge(TrackedWallet(address=address, label=label))
+                await session.commit()
+                await self.refresh_wallet_cache()
+                await sync_alchemy_webhook(list(self.wallet_cache.keys()))
+            except Exception: await session.rollback()
+
+    async def remove_tracked_wallet(self, address: str):
+        async with self.async_session() as session:
+            try:
+                await session.execute(delete(TrackedWallet).where(TrackedWallet.address == address))
+                await session.commit()
+                await self.refresh_wallet_cache()
+                await sync_alchemy_webhook(list(self.wallet_cache.keys()))
+            except Exception: await session.rollback()
+
     async def insert_candidate(self, address: str, mint: str, price: float):
         async with self.async_session() as session:
             try:
@@ -167,6 +205,25 @@ class SignalStore:
         async with self.async_session() as session:
             res = await session.execute(select(TrackedWallet.address, TrackedWallet.label))
             return {str(row[0]): (str(row[1]) if row[1] else str(row[0])[:6]) for row in res.all()}
+
+async def sync_alchemy_webhook(addresses: List[str]):
+    if not ALCHEMY_AUTH_TOKEN or not ALCHEMY_WEBHOOK_ID: return
+    url = "https://dashboard.alchemy.com/api/update-webhook-addresses"
+    headers = {"X-Alchemy-Token": ALCHEMY_AUTH_TOKEN, "Content-Type": "application/json"}
+    payload = {"webhook_id": ALCHEMY_WEBHOOK_ID, "addresses_to_add": addresses, "addresses_to_remove": []}
+    try:
+        async with aiohttp.ClientSession(timeout=GLOBAL_TIMEOUT) as s:
+            await s.patch(url, json=payload, headers=headers)
+    except Exception: pass
+
+class DiscoveryHunter:
+    def __init__(self, session: aiohttp.ClientSession): self.session = session
+    async def is_whale_funded(self, wallet_address: str) -> bool:
+        payload = {"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [wallet_address]}
+        try:
+            data = await request_with_retry(self.session, "POST", ALCHEMY_RPC_URL, json=payload)
+            return int(data.get("result", {}).get("value", 0)) > 50_000_000_000
+        except Exception: return False
 
 class DexEngine:
     def __init__(self, session: aiohttp.ClientSession):
@@ -189,38 +246,43 @@ class DexEngine:
         except Exception: pass
         return {"price": 0, "symbol": "UNK", "vol24": 0, "liq": 0}
 
+class SecurityEngine:
+    async def get_safety_report(self, address: str, vol_24h: float, liq: float) -> Dict[str, Any]:
+        return {"safety_score": 80, "is_rugged": False, "vl_ratio": 1.0, "liquidity": liq}
+
+class TradeExecutor:
+    def __init__(self, cfg: BotConfig): self.cfg = cfg
+    async def execute_trade(self, sig: dict):
+        if self.cfg.trade.enabled: logger.info(f"📣 [DEX EXECUTION] BUY | {sig['symbol']} | {sig['contract_address']}")
+
 app = FastAPI()
 cfg = BotConfig()
 store = SignalStore(DATABASE_URL)
-
-# Global variables for async dependencies
-http_session: Optional[aiohttp.ClientSession] = None
+# GLOBAL ENGINES
+session: Optional[aiohttp.ClientSession] = None
 dex_engine: Optional[DexEngine] = None
 
 @app.on_event("startup")
 async def startup():
-    global http_session, dex_engine
-    # Initialize async dependencies here to ensure they exist within a running event loop
-    http_session = aiohttp.ClientSession()
-    dex_engine = DexEngine(http_session)
+    global session, dex_engine
+    session = aiohttp.ClientSession()
+    dex_engine = DexEngine(session)
     await store.init_db()
-
-@app.on_event("shutdown")
-async def shutdown():
-    if http_session:
-        await http_session.close()
 
 @app.post("/webhook")
 async def process_solana_webhook(request: Request):
-    if not dex_engine:
-        return JSONResponse({"status": "error", "message": "Engine starting"}, status_code=503)
     try:
         data = await request.json()
-        transactions = data.get("event", {}).get("transaction", [])
-        
-        for tx in transactions:
-            mint = tx.get("tokenOutMint") or tx.get("rawContract", {}).get("address")
-            buyer = tx.get("fromAddress") or tx.get("feePayer")
+        logger.info(f"DEBUG: Webhook Payload Received")
+
+        # Robust Multi-Format Extraction
+        events = []
+        if isinstance(data, dict):
+            events = data.get("event", {}).get("activity", []) if "event" in data else [data]
+
+        for event in events:
+            mint = event.get("rawContract", {}).get("address") or event.get("tokenOutMint")
+            buyer = event.get("fromAddress") or event.get("feePayer")
 
             if not mint or not buyer: continue
             if await store.has_open_signal(mint): continue
@@ -232,7 +294,7 @@ async def process_solana_webhook(request: Request):
 
         return JSONResponse({"status": "success"})
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
+        logger.error(f"Webhook Processing Error: {e}")
         return JSONResponse({"status": "error"}, status_code=500)
 
 if __name__ == "__main__":
