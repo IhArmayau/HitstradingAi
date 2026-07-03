@@ -221,15 +221,6 @@ async def sync_alchemy_webhook(addresses: List[str]):
             await s.patch(url, json=payload, headers=headers)
     except Exception: pass
 
-class DiscoveryHunter:
-    def __init__(self, session: aiohttp.ClientSession): self.session = session
-    async def is_whale_funded(self, wallet_address: str) -> bool:
-        payload = {"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [wallet_address]}
-        try:
-            data = await request_with_retry(self.session, "POST", ALCHEMY_RPC_URL, json=payload)
-            return int(data.get("result", {}).get("value", 0)) > 50_000_000_000
-        except Exception: return False
-
 class DexEngine:
     def __init__(self, session: aiohttp.ClientSession):
         self.session = session
@@ -251,19 +242,11 @@ class DexEngine:
         except Exception: pass
         return {"price": 0, "symbol": "UNK", "vol24": 0, "liq": 0}
 
-class SecurityEngine:
-    async def get_safety_report(self, address: str, vol_24h: float, liq: float) -> Dict[str, Any]:
-        return {"safety_score": 80, "is_rugged": False, "vl_ratio": 1.0, "liquidity": liq}
-
-class TradeExecutor:
-    def __init__(self, cfg: BotConfig): self.cfg = cfg
-    async def execute_trade(self, sig: dict):
-        if self.cfg.trade.enabled: logger.info(f"📣 [DEX EXECUTION] BUY | {sig['symbol']} | {sig['contract_address']}")
-
 app = FastAPI()
 cfg = BotConfig()
 store = SignalStore(DATABASE_URL)
-active_monitors_data = {}
+http_session = aiohttp.ClientSession()
+dex_engine = DexEngine(http_session)
 
 @app.on_event("startup")
 async def startup():
@@ -276,25 +259,18 @@ async def run_bot_initialization():
 async def process_solana_webhook(request: Request):
     try:
         data = await request.json()
-        logger.info(f"DEBUG: Webhook Payload: {str(data)[:200]}")
         
-        # Robust Multi-Format Extraction
-        events = []
-        if isinstance(data, dict):
-            events = data.get("event", {}).get("activity", []) if "event" in data else [data]
+        # Correctly navigate Alchemy's ADDRESS_ACTIVITY structure
+        transactions = data.get("event", {}).get("transaction", [])
         
-        for event in events:
-            # Extract Mint/Buyer dynamically
-            mint = event.get("rawContract", {}).get("address") or event.get("tokenOutMint")
-            buyer = event.get("fromAddress") or event.get("feePayer")
-            
+        for tx in transactions:
+            # Navigate nested structure to find contract details
+            mint = tx.get("tokenOutMint") or tx.get("rawContract", {}).get("address")
+            buyer = tx.get("fromAddress") or tx.get("feePayer")
+
             if not mint or not buyer: continue
             if await store.has_open_signal(mint): continue
-            
-            # Logic bridge
-            is_whale = False 
-            is_sniper = buyer in store.wallet_cache
-            
+
             # Direct Processing
             dex_data = await dex_engine.get_price_data(mint)
             if dex_data['price'] > 0:
@@ -302,7 +278,9 @@ async def process_solana_webhook(request: Request):
                 logger.info(f"📥 Candidate Stored: {buyer[:8]} -> {mint[:8]}")
 
         return JSONResponse({"status": "success"})
-    except Exception: return JSONResponse({"status": "error"}, status_code=500)
+    except Exception as e:
+        logger.error(f"Webhook processing error: {e}")
+        return JSONResponse({"status": "error"}, status_code=500)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
