@@ -3,11 +3,10 @@ import asyncio
 import logging
 import os
 import sys
-import re
 import time
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Any, Tuple
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 import aiohttp
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -15,7 +14,7 @@ from fastapi.responses import JSONResponse
 import uvicorn
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, Integer, String, Float, Text, select, delete, func, Index
+from sqlalchemy import Column, Integer, String, Float, Text, select, delete, Index
 
 # -----------------------------
 # Logging Configuration
@@ -43,12 +42,7 @@ if missing_vars:
     logger.critical(f"❌ STARTUP FAILURE: Missing required environment variables: {', '.join(missing_vars)}")
     sys.exit(1)
 
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
-elif DATABASE_URL.startswith("postgresql://") and "+asyncpg" not in DATABASE_URL:
-    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
-
+DATABASE_URL = os.getenv("DATABASE_URL", "").replace("postgres://", "postgresql+asyncpg://", 1)
 ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY", "")
 ALCHEMY_AUTH_TOKEN = os.getenv("ALCHEMY_AUTH_TOKEN", "")
 ALCHEMY_WEBHOOK_ID = os.getenv("ALCHEMY_WEBHOOK_ID", "")
@@ -116,26 +110,7 @@ class WalletCandidate(Base):
 
 Index("idx_wallet_cand_lookup", WalletCandidate.address, WalletCandidate.token_mint)
 
-class BotSetting(Base):
-    __tablename__ = "bot_settings"
-    key = Column(String, primary_key=True)
-    value = Column(Text)
-
 GLOBAL_TIMEOUT = aiohttp.ClientTimeout(total=5.0)
-
-async def request_with_retry(session: aiohttp.ClientSession, method: str, url: str, retries: int = 3, **kwargs):
-    kwargs["timeout"] = kwargs.get("timeout", GLOBAL_TIMEOUT)
-    for i in range(retries):
-        try:
-            async with session.request(method, url, **kwargs) as resp:
-                if resp.status == 429:
-                    wait = (i + 1) * 5
-                    await asyncio.sleep(wait)
-                    continue
-                return await resp.json()
-        except Exception as e:
-            if i == retries - 1: raise e
-            await asyncio.sleep(2 ** i)
 
 class PriceCache:
     def __init__(self, ttl_seconds: float = 3.0):
@@ -175,24 +150,6 @@ class SignalStore:
                 await session.commit()
             except Exception: await session.rollback()
 
-    async def add_tracked_wallet(self, address: str, label: str = "Manual"):
-        async with self.async_session() as session:
-            try:
-                await session.merge(TrackedWallet(address=address, label=label))
-                await session.commit()
-                await self.refresh_wallet_cache()
-                await sync_alchemy_webhook(list(self.wallet_cache.keys()))
-            except Exception: await session.rollback()
-
-    async def remove_tracked_wallet(self, address: str):
-        async with self.async_session() as session:
-            try:
-                await session.execute(delete(TrackedWallet).where(TrackedWallet.address == address))
-                await session.commit()
-                await self.refresh_wallet_cache()
-                await sync_alchemy_webhook(list(self.wallet_cache.keys()))
-            except Exception: await session.rollback()
-
     async def insert_candidate(self, address: str, mint: str, price: float):
         async with self.async_session() as session:
             try:
@@ -210,16 +167,6 @@ class SignalStore:
         async with self.async_session() as session:
             res = await session.execute(select(TrackedWallet.address, TrackedWallet.label))
             return {str(row[0]): (str(row[1]) if row[1] else str(row[0])[:6]) for row in res.all()}
-
-async def sync_alchemy_webhook(addresses: List[str]):
-    if not ALCHEMY_AUTH_TOKEN or not ALCHEMY_WEBHOOK_ID: return
-    url = "https://dashboard.alchemy.com/api/update-webhook-addresses"
-    headers = {"X-Alchemy-Token": ALCHEMY_AUTH_TOKEN, "Content-Type": "application/json"}
-    payload = {"webhook_id": ALCHEMY_WEBHOOK_ID, "addresses_to_add": addresses, "addresses_to_remove": []}
-    try:
-        async with aiohttp.ClientSession(timeout=GLOBAL_TIMEOUT) as s:
-            await s.patch(url, json=payload, headers=headers)
-    except Exception: pass
 
 class DexEngine:
     def __init__(self, session: aiohttp.ClientSession):
@@ -245,33 +192,39 @@ class DexEngine:
 app = FastAPI()
 cfg = BotConfig()
 store = SignalStore(DATABASE_URL)
-http_session = aiohttp.ClientSession()
-dex_engine = DexEngine(http_session)
+
+# Global variables for async dependencies
+http_session: Optional[aiohttp.ClientSession] = None
+dex_engine: Optional[DexEngine] = None
 
 @app.on_event("startup")
 async def startup():
-    asyncio.create_task(run_bot_initialization())
-
-async def run_bot_initialization():
+    global http_session, dex_engine
+    # Initialize async dependencies here to ensure they exist within a running event loop
+    http_session = aiohttp.ClientSession()
+    dex_engine = DexEngine(http_session)
     await store.init_db()
+
+@app.on_event("shutdown")
+async def shutdown():
+    if http_session:
+        await http_session.close()
 
 @app.post("/webhook")
 async def process_solana_webhook(request: Request):
+    if not dex_engine:
+        return JSONResponse({"status": "error", "message": "Engine starting"}, status_code=503)
     try:
         data = await request.json()
-        
-        # Correctly navigate Alchemy's ADDRESS_ACTIVITY structure
         transactions = data.get("event", {}).get("transaction", [])
         
         for tx in transactions:
-            # Navigate nested structure to find contract details
             mint = tx.get("tokenOutMint") or tx.get("rawContract", {}).get("address")
             buyer = tx.get("fromAddress") or tx.get("feePayer")
 
             if not mint or not buyer: continue
             if await store.has_open_signal(mint): continue
 
-            # Direct Processing
             dex_data = await dex_engine.get_price_data(mint)
             if dex_data['price'] > 0:
                 await store.insert_candidate(buyer, mint, dex_data['price'])
@@ -279,7 +232,7 @@ async def process_solana_webhook(request: Request):
 
         return JSONResponse({"status": "success"})
     except Exception as e:
-        logger.error(f"Webhook processing error: {e}")
+        logger.error(f"Webhook error: {e}")
         return JSONResponse({"status": "error"}, status_code=500)
 
 if __name__ == "__main__":
